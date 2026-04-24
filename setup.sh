@@ -543,7 +543,12 @@ check_homebrew_health() {
     # Still broken — offer to reinstall
     print_warning "No se pudo reparar automáticamente."
     echo ""
-    read -rp "  ¿Reinstalar Homebrew? Se perderán los paquetes instalados (s/N): " confirm
+    if [[ "${CLAUDE_SETUP_YES:-0}" == "1" ]]; then
+        confirm="s"
+        print_info "CLAUDE_SETUP_YES=1 — auto-confirmando reinstalación de Homebrew"
+    else
+        read -rp "  ¿Reinstalar Homebrew? Se perderán los paquetes instalados (s/N): " confirm
+    fi
     if [[ "$confirm" != "s" && "$confirm" != "S" ]]; then
         print_info "Continuando con Homebrew en su estado actual (puede fallar)."
         return 0
@@ -669,6 +674,17 @@ install_node() {
     fi
 }
 
+is_brew_python() {
+    # Returns 0 if python3 in PATH resolves to a brew-provided binary
+    local py_path
+    py_path="$(command -v python3 2>/dev/null)"
+    [[ -z "$py_path" ]] && return 1
+    # Resolve symlinks to real path
+    local real_path
+    real_path="$(readlink -f "$py_path" 2>/dev/null || python3 -c "import os,sys; print(os.path.realpath(sys.argv[1]))" "$py_path" 2>/dev/null || echo "$py_path")"
+    [[ "$real_path" == "$HOMEBREW_PREFIX"/* ]]
+}
+
 install_python() {
     print_step "Verificando Python..."
 
@@ -690,11 +706,21 @@ install_python() {
         brew_python_installed=true
     fi
 
+    # Prepend libexec/bin to PATH so `python3`/`pip3` resolve to brew (python@3.x is keg-only)
+    local python_libexec="$HOMEBREW_PREFIX/opt/$PYTHON_FORMULA/libexec/bin"
+    if [[ -d "$python_libexec" ]]; then
+        export PATH="$python_libexec:$PATH"
+        hash -r 2>/dev/null || true
+    fi
+
     # NEVER touch /usr/bin/python3 (Apple system Python — externally-managed)
-    # We verify that python3 + pip3 work and come from brew; if not, we install via brew
-    if [[ "$brew_python_installed" == true ]] && command_exists python3 && python3 -m pip --version &>/dev/null && python3 -c "import venv" &>/dev/null; then
+    # Skip if brew python is installed AND `python3` now resolves to brew (not Apple)
+    if [[ "$brew_python_installed" == true ]] && is_brew_python && python3 -m pip --version &>/dev/null && python3 -c "import venv" &>/dev/null; then
         print_skip "Python ya instalado vía Homebrew ($(python3 --version 2>&1))"
         ALREADY_INSTALLED+=("Python")
+        # Persist libexec path so uninstall can clean it (if it was absent from state)
+        [[ -d "$python_libexec" ]] && state_set python_libexec "$python_libexec"
+        configure_python_path
         return 0
     fi
 
@@ -708,15 +734,37 @@ install_python() {
 
     brew install "$PYTHON_FORMULA"
 
-    # Verify install succeeded (python3 should resolve to the brew symlink)
-    if command_exists python3 && python3 -m pip --version &>/dev/null && python3 -c "import venv" &>/dev/null; then
+    # Re-prepend libexec/bin (may have been created just now) and refresh shell's cmd cache
+    python_libexec="$HOMEBREW_PREFIX/opt/$PYTHON_FORMULA/libexec/bin"
+    if [[ -d "$python_libexec" ]]; then
+        export PATH="$python_libexec:$PATH"
+        hash -r 2>/dev/null || true
+    fi
+
+    # Verify install succeeded: python3 must resolve to brew AND pip/venv must work
+    if is_brew_python && python3 -m pip --version &>/dev/null && python3 -c "import venv" &>/dev/null; then
         print_success "Python instalado ($(python3 --version 2>&1))"
         print_info "pip: $(python3 -m pip --version 2>&1 | awk '{print $1, $2}')"
+        print_info "ruta: $(command -v python3)"
         INSTALLED+=("Python")
         # Record ownership for uninstall
         state_set python_installed_by_us 1
         state_set python_channel brew
         state_set python_formula "$PYTHON_FORMULA"
+        state_set python_libexec "$python_libexec"
+        configure_python_path
+    elif [[ -x "$python_libexec/python3" ]] && "$python_libexec/python3" -m pip --version &>/dev/null; then
+        # Brew install worked but shell cache may still see /usr/bin/python3 — force profile update
+        print_success "Python instalado ($("$python_libexec/python3" --version 2>&1))"
+        print_info "pip: $("$python_libexec/python3" -m pip --version 2>&1 | awk '{print $1, $2}')"
+        print_info "ruta: $python_libexec/python3"
+        INSTALLED+=("Python")
+        state_set python_installed_by_us 1
+        state_set python_channel brew
+        state_set python_formula "$PYTHON_FORMULA"
+        state_set python_libexec "$python_libexec"
+        configure_python_path
+        NEED_NEW_TERMINAL=true
     else
         print_error "No se pudo instalar Python o verificar pip/venv"
         print_info "Intenta manualmente: brew install $PYTHON_FORMULA"
@@ -744,6 +792,36 @@ configure_claude_path() {
             echo '# Claude Code' >> "$shell_profile"
             echo "$claude_path_line" >> "$shell_profile"
             print_info "Claude Code agregado al PATH en $shell_profile"
+        fi
+    fi
+}
+
+configure_python_path() {
+    # python@3.x is keg-only — unversioned `python3`/`pip3` live in libexec/bin.
+    # Persist that directory in the user's shell profile so `python3` resolves to brew.
+    local libexec="$HOMEBREW_PREFIX/opt/$PYTHON_FORMULA/libexec/bin"
+    [[ ! -d "$libexec" ]] && return 0
+
+    if [[ "$USER_SHELL" == "fish" ]]; then
+        local fish_conf_dir="$HOME/.config/fish/conf.d"
+        local fish_conf="$fish_conf_dir/python.fish"
+        if ! grep -qF "$libexec" "$fish_conf" 2>/dev/null; then
+            mkdir -p "$fish_conf_dir"
+            {
+                echo "# Python ($PYTHON_FORMULA)"
+                echo "set -gx PATH $libexec \$PATH"
+            } > "$fish_conf"
+            print_info "Python agregado al PATH en $fish_conf"
+        fi
+    else
+        local shell_profile="$USER_SHELL_PROFILE"
+        if ! grep -qF "$libexec" "$shell_profile" 2>/dev/null; then
+            {
+                echo ''
+                echo "# Python ($PYTHON_FORMULA)"
+                echo "export PATH=\"$libexec:\$PATH\""
+            } >> "$shell_profile"
+            print_info "Python agregado al PATH en $shell_profile"
         fi
     fi
 }
@@ -828,7 +906,12 @@ print_summary() {
     command_exists git     && echo "     Git:         $(git --version | sed 's/git version //')"
     command_exists node    && echo "     Node.js:     $(node --version)"
     command_exists npm     && echo "     npm:         $(npm --version)"
-    command_exists python3 && echo "     Python:      $(python3 --version 2>&1)"
+    if command_exists python3; then
+        local py_bin py_from
+        py_bin="$(command -v python3)"
+        if is_brew_python; then py_from="brew"; else py_from="$py_bin"; fi
+        echo "     Python:      $(python3 --version 2>&1) ($py_from)"
+    fi
     python3 -m pip --version &>/dev/null && echo "     pip:         $(python3 -m pip --version 2>&1 | awk '{print $1, $2}')"
     command_exists claude  && echo "     Claude Code: $(claude --version 2>/dev/null || echo 'ver nueva terminal')"
     echo "  ─────────────────────────────────"
@@ -935,6 +1018,28 @@ uninstall_node() {
     fi
 }
 
+remove_python_path_from_profile() {
+    # Remove the Python libexec/bin entry we added during install
+    local libexec
+    libexec="$(state_get python_libexec)"
+    [[ -z "$libexec" ]] && libexec="$HOMEBREW_PREFIX/opt/$PYTHON_FORMULA/libexec/bin"
+
+    if [[ -n "$USER_SHELL_PROFILE" && -f "$USER_SHELL_PROFILE" ]]; then
+        # Remove the "# Python (...)" header line AND the export PATH line that follows
+        local tmp
+        tmp="$(mktemp)"
+        awk -v libexec="$libexec" '
+            /^# Python \(python@[0-9.]+\)$/ { skip = 2 }
+            skip > 0 { skip--; next }
+            index($0, libexec) > 0 { next }
+            { print }
+        ' "$USER_SHELL_PROFILE" > "$tmp" && mv "$tmp" "$USER_SHELL_PROFILE"
+    fi
+
+    # Fish shell conf
+    rm -f "$HOME/.config/fish/conf.d/python.fish" 2>/dev/null
+}
+
 uninstall_python() {
     print_step "Desinstalando Python..."
 
@@ -958,6 +1063,9 @@ uninstall_python() {
     local formula
     formula="$(state_get python_formula)"
     [[ -z "$formula" ]] && formula="$PYTHON_FORMULA"
+
+    # Clean up PATH entry from profile regardless of brew success
+    remove_python_path_from_profile
 
     if [[ -n "$brew_cmd" ]] && $brew_cmd list "$formula" &>/dev/null; then
         $brew_cmd uninstall --ignore-dependencies "$formula" 2>/dev/null || true
@@ -992,47 +1100,80 @@ uninstall_git() {
 uninstall_homebrew() {
     print_step "Desinstalando Homebrew..."
 
-    if command_exists brew || [[ -f "$HOMEBREW_PREFIX/bin/brew" ]]; then
-        NONINTERACTIVE=1 /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/uninstall.sh)"
+    # We intentionally do NOT use the official uninstall.sh — it invokes `sudo -l mkdir`
+    # which always prompts for a password (ignoring the sudo cache) and hangs in
+    # non-TTY automation contexts. Manual `sudo rm -rf` with pre-cached sudo is more
+    # reliable and does the exact same cleanup the official script does.
 
-        # Clean residual Homebrew files the official uninstaller misses
-        if [[ -d "$HOMEBREW_PREFIX" ]]; then
-            rm -rf "$HOMEBREW_PREFIX" 2>/dev/null
-            if [[ -d "$HOMEBREW_PREFIX" ]]; then
-                # Needs sudo to fully remove
-                sudo rm -rf "$HOMEBREW_PREFIX" 2>/dev/null || print_warning "No se pudo eliminar $HOMEBREW_PREFIX (requiere sudo)"
-            fi
-        fi
+    local brew_found=false
+    [[ -f "$HOMEBREW_PREFIX/bin/brew" ]] && brew_found=true
+    command_exists brew && brew_found=true
 
-        # Clean /etc/paths.d/homebrew (requires sudo, created by Homebrew installer)
-        if [[ -f /etc/paths.d/homebrew ]]; then
-            sudo rm -f /etc/paths.d/homebrew 2>/dev/null || print_warning "No se pudo eliminar /etc/paths.d/homebrew (requiere sudo)"
-        fi
-
-        # Limpiar profile del shell real del usuario (no solo zsh)
-        local profiles_to_clean=(
-            "$HOME/.zprofile"
-            "$HOME/.bash_profile"
-            "$HOME/.profile"
-        )
-        for profile in "${profiles_to_clean[@]}"; do
-            if [[ -f "$profile" ]]; then
-                sed -i '' '/# Homebrew/d' "$profile" 2>/dev/null
-                sed -i '' '/brew shellenv/d' "$profile" 2>/dev/null
-            fi
-        done
-
-        # Limpiar fish config si existe
-        local fish_conf="$HOME/.config/fish/conf.d/homebrew.fish"
-        if [[ -f "$fish_conf" ]]; then
-            rm -f "$fish_conf"
-        fi
-
-        print_success "Homebrew eliminado"
-        REMOVED+=("Homebrew")
-    else
+    if [[ "$brew_found" != true ]]; then
         print_skip "Homebrew no encontrado"
         NOT_FOUND+=("Homebrew")
+        # Still clean residue in case something got half-installed before
+    fi
+
+    # Check if sudo cache is warm — non-blocking (never prompt here).
+    # Interactive TTY prompting is handled upstream by run_uninstall's ensure_sudo.
+    local have_sudo=false
+    if sudo -n true 2>/dev/null; then
+        have_sudo=true
+    fi
+
+    # 1. Remove the installation prefix (/opt/homebrew or /usr/local)
+    if [[ -d "$HOMEBREW_PREFIX" ]]; then
+        # Try user-owned first (faster, no sudo needed when prefix is writable)
+        rm -rf "$HOMEBREW_PREFIX" 2>/dev/null
+        if [[ -d "$HOMEBREW_PREFIX" ]]; then
+            if [[ "$have_sudo" == true ]]; then
+                sudo rm -rf "$HOMEBREW_PREFIX" 2>/dev/null \
+                    || print_warning "No se pudo eliminar $HOMEBREW_PREFIX (ejecuta manualmente: sudo rm -rf $HOMEBREW_PREFIX)"
+            else
+                print_warning "Sin acceso sudo — $HOMEBREW_PREFIX no se eliminó"
+                print_info "Ejecuta manualmente: sudo rm -rf $HOMEBREW_PREFIX"
+            fi
+        fi
+    fi
+
+    # 2. Clean /etc/paths.d/homebrew (root-owned — needs sudo)
+    if [[ -f /etc/paths.d/homebrew ]]; then
+        if [[ "$have_sudo" == true ]]; then
+            sudo rm -f /etc/paths.d/homebrew 2>/dev/null \
+                || print_warning "No se pudo eliminar /etc/paths.d/homebrew"
+        else
+            print_warning "Sin acceso sudo — /etc/paths.d/homebrew no se eliminó"
+            print_info "Ejecuta manualmente: sudo rm -f /etc/paths.d/homebrew"
+        fi
+    fi
+
+    # 3. Clean Homebrew caches & logs (user-owned, no sudo needed)
+    rm -rf "$HOME/Library/Caches/Homebrew" 2>/dev/null
+    rm -rf "$HOME/Library/Logs/Homebrew" 2>/dev/null
+    rm -rf "$HOME/.cache/Homebrew" 2>/dev/null
+
+    # 4. Clean shell profiles — remove Homebrew block (both the `# Homebrew` comment
+    #    and the `eval "$(…/brew shellenv)"` line)
+    local profiles_to_clean=(
+        "$HOME/.zprofile"
+        "$HOME/.bash_profile"
+        "$HOME/.profile"
+    )
+    for profile in "${profiles_to_clean[@]}"; do
+        if [[ -f "$profile" ]]; then
+            sed -i '' '/# Homebrew/d' "$profile" 2>/dev/null
+            sed -i '' '/brew shellenv/d' "$profile" 2>/dev/null
+        fi
+    done
+
+    # 5. Fish shell
+    local fish_conf="$HOME/.config/fish/conf.d/homebrew.fish"
+    [[ -f "$fish_conf" ]] && rm -f "$fish_conf"
+
+    if [[ "$brew_found" == true ]]; then
+        print_success "Homebrew eliminado"
+        REMOVED+=("Homebrew")
     fi
 }
 
@@ -1088,7 +1229,12 @@ run_uninstall() {
     echo -e "  ${YELLOW}Xcode CLT NO se tocará (es parte del sistema base)${NC}"
     echo -e "  ${YELLOW}Si tenías Python antes (pyenv/uv/conda/tu instalación previa), NO se toca${NC}"
     echo ""
-    read -rp "  ¿Continuar? (s/N): " confirm
+    if [[ "${CLAUDE_SETUP_YES:-0}" == "1" ]]; then
+        confirm="s"
+        print_info "CLAUDE_SETUP_YES=1 — auto-confirmando desinstalación"
+    else
+        read -rp "  ¿Continuar? (s/N): " confirm
+    fi
     if [[ "$confirm" != "s" && "$confirm" != "S" ]]; then
         echo ""
         print_info "Desinstalación cancelada."
@@ -1096,6 +1242,14 @@ run_uninstall() {
     fi
 
     echo ""
+    # Pre-cache sudo so we don't prompt mid-uninstall. In automation (CLAUDE_SETUP_YES=1)
+    # we expect the caller to have pre-cached sudo or to accept a best-effort cleanup.
+    if [[ "${CLAUDE_SETUP_YES:-0}" != "1" ]] && ! sudo -n true 2>/dev/null; then
+        print_info "Se necesita tu contraseña de macOS para eliminar archivos del sistema:"
+        sudo -v 2>/dev/null || print_warning "Sin acceso sudo — se hará limpieza best-effort"
+        echo ""
+    fi
+
     print_info "Iniciando desinstalación..."
     echo ""
 

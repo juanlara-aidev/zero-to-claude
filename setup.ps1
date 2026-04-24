@@ -122,6 +122,17 @@ function Test-IsAdmin {
     return $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
 }
 
+# Graceful halt used instead of `exit` so that when the script is run via
+# `irm ... | iex` (top-level shell scope), halting the installer doesn't
+# also close the user's PowerShell window. The outer try/catch around Main
+# swallows the marker silently; real exceptions re-throw.
+function Invoke-Halt {
+    param([int]$Code = 0)
+    # Hard-coded marker (not $script:) so it resolves identically whether the
+    # script is run via `.\setup.ps1`, `-File`, or `irm ... | iex`.
+    throw "ZERO_CLAUDE_HALT"
+}
+
 function Get-DefaultWSLUserName {
     # Derive a Linux-compatible username from the Windows logged-in user.
     # Rules: lowercase a-z/0-9/_/-, must start with a letter, <=31 chars,
@@ -151,7 +162,7 @@ function Test-WindowsVersion {
     if ($version.Major -eq 10 -and $version.Build -lt 19041) {
         Write-Err "Se requiere Windows 10 2004+ (Build 19041+) para WSL 2. Build actual: $($version.Build)"
         Write-Info "Windows 10 1809 (17763+) es compatible con el modo --native, pero no con WSL."
-        exit 1
+        Invoke-Halt -Code 1
     }
     Write-Ok "Windows (Build $($version.Build)) detectado"
 }
@@ -294,7 +305,7 @@ function Test-Internet {
         Write-Err "No se detecto conexion a internet."
         Write-Info "Verifica tu conexion y ejecuta el script de nuevo."
         Write-Info "Si estas detras de un proxy, configura HTTP_PROXY y HTTPS_PROXY."
-        exit 1
+        Invoke-Halt -Code 1
     }
 }
 
@@ -306,7 +317,7 @@ function Test-DiskSpace {
         Write-Err "Espacio en disco insuficiente."
         Write-Info "Disponible: $freeGB GB — Se requieren al menos $MinGB GB."
         Write-Info "Libera espacio y ejecuta el script de nuevo."
-        exit 1
+        Invoke-Halt -Code 1
     }
     Write-Ok "Espacio en disco suficiente ($freeGB GB disponibles)"
 }
@@ -328,7 +339,7 @@ function Test-AdminRequired {
         Write-Err "Se requiere PowerShell como Administrador."
         Write-Info "Cierra esta ventana, abre PowerShell como Administrador (click derecho"
         Write-Info "-> 'Ejecutar como administrador') y vuelve a correr el comando."
-        exit 1
+        Invoke-Halt -Code 1
     }
     Write-Ok "PowerShell corriendo como Administrador"
 }
@@ -358,7 +369,7 @@ function Test-Virtualization {
             Write-Info "Entra al BIOS/UEFI y habilita 'Virtualization Technology' o 'SVM Mode'."
             Write-Info "Si prefieres instalar sin WSL, usa: `$env:CLAUDE_SETUP_NATIVE='1'; irm ... | iex"
             Write-Info "Para saltar esta verificacion: `$env:CLAUDE_SETUP_SKIP_VIRT_CHECK='1'"
-            exit 1
+            Invoke-Halt -Code 1
         }
     } catch {
         Write-Warn "No se pudo verificar virtualizacion via CIM — continuando"
@@ -372,7 +383,7 @@ function Test-WingetHealth {
         if ($Fatal) {
             Write-Err "winget no encontrado."
             Write-Info "Instala 'App Installer' desde Microsoft Store: https://aka.ms/getwinget"
-            exit 1
+            Invoke-Halt -Code 1
         } else {
             Write-Warn "winget no encontrado (no critico en modo WSL)"
             return
@@ -606,7 +617,7 @@ function Invoke-PhaseA-EnableWSL {
                 Write-Info "Reinicia manualmente cuando puedas y vuelve a correr el comando."
             }
         }
-        exit 0
+        Invoke-Halt -Code 0
     }
 
     # Try to set WSL 2 as default (requires kernel). Wrap with 30s timeout —
@@ -1978,4 +1989,16 @@ function Main {
     Invoke-WSLMode
 }
 
-Main @args
+# Wrap Main in a try/catch that swallows our intentional "halt" marker so
+# that `irm ... | iex` doesn't close the user's PowerShell window when the
+# installer stops (e.g. after showing the reboot banner, or on preflight
+# failures like "not admin"). Real errors still bubble up.
+try {
+    Main @args
+} catch {
+    if ($_.Exception.Message -ne "ZERO_CLAUDE_HALT") {
+        throw
+    }
+    # Intentional halt — messages already printed by the caller.
+    # Terminal stays open (critical for `irm | iex` invocations).
+}

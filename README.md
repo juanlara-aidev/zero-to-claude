@@ -24,11 +24,16 @@ El instalador habilita **WSL 2 + Ubuntu** y te pedirá **reiniciar la primera ve
 
 ## Después de instalar
 
-1. Cierra tu terminal
-2. Abre una nueva terminal
-3. Escribe `claude`
-4. Inicia sesión con tu cuenta de Claude (Pro, Max, Team o Enterprise)
+Tu entorno de desarrollo vive **dentro de Ubuntu (WSL)**. El instalador configura todo para que sea tu terminal por defecto:
+
+1. Cierra tu terminal actual.
+2. Abre **Windows Terminal** (Win+X → "Terminal" o busca "Terminal" en el menú Inicio).
+   Se abre **directamente dentro de Ubuntu** — estás en un shell Linux con `git`, `node`, `npm`, `python3`, `pip`, `claude` ya listos.
+3. Escribe `claude` y presiona Enter.
+4. Inicia sesión con tu cuenta de Claude (Pro, Max, Team o Enterprise) desde el navegador.
 5. ¡Listo!
+
+Alternativas: puedes hacer doble-clic en el shortcut **"Claude Dev (Ubuntu)"** del escritorio, o desde cmd.exe/PowerShell escribir `claude` (un wrapper lo ejecuta dentro de WSL automáticamente, sin entrar al shell Linux).
 
 ## Qué se instala
 
@@ -82,11 +87,13 @@ $env:CLAUDE_SETUP_UNINSTALL="1"; irm https://raw.githubusercontent.com/juanlara-
 
 ## Bueno saberlo
 
+- **El entorno Linux es el default** — en Windows, el instalador configura Windows Terminal para que el perfil Ubuntu sea el primero. Abres Terminal y ya estás codeando en Ubuntu. También crea un shortcut "Claude Dev (Ubuntu)" en el escritorio.
 - **Se puede ejecutar varias veces** — solo instala lo que falta (idempotente).
 - **Respeta version managers** — Node (nvm/fnm/volta/asdf/mise) y Python (pyenv/uv/conda/mamba/asdf/mise/rye). Si detecta uno activo, no duplica nada.
 - **Respeta tu Ubuntu si ya existe** — si ya tienes una distro Ubuntu registrada en WSL, la reusa y reusa tu usuario existente.
+- **Respeta tu Windows Terminal si lo tenías customizado** — guarda el `defaultProfile` anterior antes de cambiarlo; el uninstall lo restaura byte-exact desde un backup (`settings.json.zero-claude.bak`).
 - **Reinicio automático manejado** — después del reinicio obligatorio de WSL, vuelve a correr el comando y el instalador retoma donde quedó via `%LOCALAPPDATA%\zero-claude\state.json`.
-- **Desinstalación completa y respetuosa** — elimina binarios, configuraciones, entradas de PATH y residuos del sistema, pero no toca Python/Node que tenías antes de correr el script.
+- **Desinstalación completa y respetuosa** — elimina binarios, configuraciones, entradas de PATH, shortcut del escritorio, y restaura el default profile de Windows Terminal. No toca Python/Node que tenías antes de correr el script.
 
 ---
 

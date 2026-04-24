@@ -915,8 +915,188 @@ function Invoke-PhaseD-HostWrapper {
         $env:Path = "$($script:HostWrapperDir);$env:Path"
     }
 
-    Save-State -Phase "done" -Artifacts @{ hostWrapper = $true }
+    Save-State -Phase "host-wrapper-done" -Artifacts @{ hostWrapper = $true }
     return $true
+}
+
+# ═══════════════════════════════════════════════════════════════
+#  WSL Mode — Fase E: Default-to-Linux (Windows Terminal + shortcut)
+# ═══════════════════════════════════════════════════════════════
+
+function Get-WindowsTerminalSettingsPath {
+    $pkgs = Get-ChildItem "$env:LOCALAPPDATA\Packages" -Filter "Microsoft.WindowsTerminal*" -Directory -ErrorAction SilentlyContinue
+    foreach ($pkg in $pkgs) {
+        $settings = Join-Path $pkg.FullName "LocalState\settings.json"
+        if (Test-Path $settings) { return $settings }
+    }
+    return $null
+}
+
+function Read-WindowsTerminalSettings {
+    param([string]$Path)
+    try {
+        $content = Get-Content $Path -Raw -ErrorAction Stop
+        if (-not $content) { return $null }
+        # Strip JSON5-style comments (Windows Terminal ships them by default)
+        $stripped = [regex]::Replace($content, '(?m)//.*?$', '')
+        $stripped = [regex]::Replace($stripped, '/\*.*?\*/', '', 'Singleline')
+        return ($stripped | ConvertFrom-Json -ErrorAction Stop)
+    } catch {
+        return $null
+    }
+}
+
+function Set-WindowsTerminalDefaultToUbuntu {
+    $wtSettings = Get-WindowsTerminalSettingsPath
+    if (-not $wtSettings) {
+        Write-Skip "Windows Terminal no instalado — se salta configuracion de default profile"
+        return @{ Changed = $false }
+    }
+
+    $settings = Read-WindowsTerminalSettings -Path $wtSettings
+    if (-not $settings) {
+        Write-Warn "No se pudo leer settings.json de Windows Terminal (se deja sin cambios)"
+        return @{ Changed = $false }
+    }
+    if (-not $settings.profiles -or -not $settings.profiles.list) {
+        Write-Warn "Windows Terminal aun no ha generado perfiles — abre WT una vez y vuelve a correr si quieres Ubuntu como default"
+        return @{ Changed = $false }
+    }
+
+    $ubuntu = $settings.profiles.list | Where-Object {
+        ($_.source -eq "Windows.Terminal.Wsl" -or $_.commandline -imatch 'wsl') -and $_.name -imatch '^Ubuntu'
+    } | Select-Object -First 1
+
+    if (-not $ubuntu) {
+        Write-Warn "Perfil Ubuntu aun no aparece en Windows Terminal — puede tardar unos segundos en generarse"
+        return @{ Changed = $false }
+    }
+
+    if ($settings.defaultProfile -eq $ubuntu.guid) {
+        Write-Skip "Windows Terminal ya tiene Ubuntu como perfil por defecto"
+        return @{ Changed = $false; AlreadyDefault = $true; SettingsPath = $wtSettings }
+    }
+
+    $backup = $settings.defaultProfile
+    $settings.defaultProfile = $ubuntu.guid
+
+    try {
+        # Backup original settings.json once so we can restore verbatim on uninstall
+        $backupFile = "$wtSettings.zero-claude.bak"
+        if (-not (Test-Path $backupFile)) {
+            Copy-Item $wtSettings $backupFile -Force
+        }
+        $newJson = $settings | ConvertTo-Json -Depth 32
+        Set-Content -Path $wtSettings -Value $newJson -Encoding UTF8
+        Write-Ok "Windows Terminal: perfil por defecto -> Ubuntu"
+        return @{ Changed = $true; BackupDefault = $backup; SettingsPath = $wtSettings; BackupFile = $backupFile }
+    } catch {
+        Write-Warn "No se pudo escribir settings.json de Windows Terminal: $_"
+        return @{ Changed = $false }
+    }
+}
+
+function New-ClaudeDevShortcut {
+    $desktop = [Environment]::GetFolderPath("Desktop")
+    if (-not $desktop -or -not (Test-Path $desktop)) {
+        Write-Warn "No se pudo ubicar el escritorio del usuario"
+        return @{ Created = $false }
+    }
+    $shortcutPath = Join-Path $desktop "Claude Dev (Ubuntu).lnk"
+
+    if (Test-Path $shortcutPath) {
+        Write-Skip "Shortcut 'Claude Dev (Ubuntu)' ya existe en el escritorio"
+        return @{ Created = $false; Path = $shortcutPath }
+    }
+
+    try {
+        $shell = New-Object -ComObject WScript.Shell
+        $sc = $shell.CreateShortcut($shortcutPath)
+        $sc.TargetPath = "$env:SystemRoot\System32\wsl.exe"
+        $sc.Arguments = "-d $($script:ActualDistro) --cd ~"
+        $sc.WorkingDirectory = $env:USERPROFILE
+        $sc.IconLocation = "$env:SystemRoot\System32\wsl.exe,0"
+        $sc.Description = "Entra a tu entorno de desarrollo Ubuntu con Claude Code"
+        $sc.Save()
+        Write-Ok "Shortcut creado: 'Claude Dev (Ubuntu)' en el escritorio"
+        return @{ Created = $true; Path = $shortcutPath }
+    } catch {
+        Write-Warn "No se pudo crear el shortcut del escritorio: $_"
+        return @{ Created = $false }
+    }
+}
+
+function Invoke-PhaseE-DefaultToLinux {
+    Write-Separator
+    Write-Host "  Fase E: Entorno Linux como default" -ForegroundColor Cyan
+    Write-Separator
+    Write-Host ""
+
+    $wt = Set-WindowsTerminalDefaultToUbuntu
+    $sc = New-ClaudeDevShortcut
+
+    Save-State -Phase "done" -Artifacts @{
+        wtDefaultChanged = [bool]$wt.Changed
+        wtDefaultBackup = if ($wt.BackupDefault) { [string]$wt.BackupDefault } else { "" }
+        wtSettingsPath = if ($wt.SettingsPath) { [string]$wt.SettingsPath } else { "" }
+        wtSettingsBackupFile = if ($wt.BackupFile) { [string]$wt.BackupFile } else { "" }
+        desktopShortcut = if ($sc.Created -and $sc.Path) { [string]$sc.Path } else { "" }
+    }
+
+    Write-Ok "Entorno Linux configurado como default"
+    return $true
+}
+
+function Reset-WindowsTerminalDefault {
+    param($State)
+    if (-not $State -or -not $State.artifactsInstalled) { return }
+    $art = $State.artifactsInstalled
+    if (-not $art.wtDefaultChanged) { return }
+
+    $path = $art.wtSettingsPath
+    $backupFile = $art.wtSettingsBackupFile
+    $origDefault = $art.wtDefaultBackup
+
+    if (-not $path -or -not (Test-Path $path)) { return }
+
+    try {
+        # Prefer restoring the full backup file (preserves original comments/formatting)
+        if ($backupFile -and (Test-Path $backupFile)) {
+            Copy-Item $backupFile $path -Force
+            Remove-Item $backupFile -Force -ErrorAction SilentlyContinue
+            Write-Ok "Windows Terminal settings.json restaurado desde backup"
+            return
+        }
+        # Fallback: just flip the defaultProfile back
+        $settings = Read-WindowsTerminalSettings -Path $path
+        if ($settings -and $origDefault) {
+            $settings.defaultProfile = $origDefault
+            $newJson = $settings | ConvertTo-Json -Depth 32
+            Set-Content -Path $path -Value $newJson -Encoding UTF8
+            Write-Ok "Windows Terminal default profile restaurado"
+        }
+    } catch {
+        Write-Warn "No se pudo restaurar default profile de Windows Terminal: $_"
+    }
+}
+
+function Remove-ClaudeDevShortcut {
+    param($State)
+    $paths = @()
+    if ($State -and $State.artifactsInstalled -and $State.artifactsInstalled.desktopShortcut) {
+        $paths += $State.artifactsInstalled.desktopShortcut
+    }
+    $desktop = [Environment]::GetFolderPath("Desktop")
+    if ($desktop) { $paths += (Join-Path $desktop "Claude Dev (Ubuntu).lnk") }
+
+    $removed = $false
+    foreach ($p in ($paths | Select-Object -Unique)) {
+        if ($p -and (Test-Path $p)) {
+            Remove-Item $p -Force -ErrorAction SilentlyContinue
+            $removed = $true
+        }
+    }
+    if ($removed) { Write-Ok "Shortcut 'Claude Dev (Ubuntu)' eliminado" }
 }
 
 # ═══════════════════════════════════════════════════════════════
@@ -1205,15 +1385,23 @@ function Write-Summary {
         Write-Host "  -------------------------------------"
         Write-Host ""
         Write-Separator
-        Write-Host "  Siguiente paso:" -ForegroundColor White
-        Write-Host "     1. CIERRA esta terminal"
-        Write-Host "     2. ABRE una nueva terminal"
-        Write-Host "     3. Escribe:  claude"
-        Write-Host "        (el wrapper ejecuta claude dentro de Ubuntu automaticamente)"
-        Write-Host "     4. Autenticate con tu cuenta (Pro o Max)"
+        Write-Host "  Tu entorno de desarrollo esta en Ubuntu (WSL)." -ForegroundColor White
         Write-Host ""
-        Write-Host "     Tambien puedes entrar a Ubuntu directamente con:  wsl"
-        Write-Host "     Dentro de Ubuntu tienes git, node, npm, python3, pip y claude."
+        Write-Host "  Siguiente paso (recomendado):" -ForegroundColor White
+        Write-Host "     1. Cierra esta terminal."
+        Write-Host "     2. Abre Windows Terminal (Win+X -> 'Terminal')."
+        Write-Host "        Se abrira directamente dentro de Ubuntu."
+        Write-Host "     3. Escribe:  claude"
+        Write-Host "     4. Autenticate con tu cuenta (Pro o Max)."
+        Write-Host ""
+        Write-Host "  Tambien puedes hacer doble-clic en el shortcut"
+        Write-Host "  'Claude Dev (Ubuntu)' de tu escritorio." -ForegroundColor White
+        Write-Host ""
+        Write-Host "  Dentro de Ubuntu tienes: git, node, npm, python3, pip, claude." -ForegroundColor DarkGray
+        Write-Host "  Tus proyectos viven en tu home Linux (~) o en /mnt/c/... para Windows." -ForegroundColor DarkGray
+        Write-Host ""
+        Write-Host "  (Alternativa: desde cmd.exe/PowerShell escribe 'claude' — un wrapper" -ForegroundColor DarkGray
+        Write-Host "  lo ejecuta dentro de WSL automaticamente, sin entrar al shell.)" -ForegroundColor DarkGray
         Write-Separator
     }
     else {
@@ -1272,6 +1460,10 @@ function Uninstall-WSLMode {
     }
 
     Write-Host ""
+    # Revert Phase E first (before unregister, in case we need distro info)
+    Reset-WindowsTerminalDefault -State $State
+    Remove-ClaudeDevShortcut -State $State
+
     Write-Step "Desregistrando distro '$distroToRemove'..."
     $actualExists = (Get-InstalledUbuntuDistro) -eq $distroToRemove
     if ($actualExists -or (Test-UbuntuInstalled)) {
@@ -1637,6 +1829,7 @@ function Invoke-WSLMode {
     if (-not (Invoke-PhaseB-InstallUbuntu)) { return }
     if (-not (Invoke-PhaseC-InstallInWSL)) { return }
     if (-not (Invoke-PhaseD-HostWrapper)) { return }
+    if (-not (Invoke-PhaseE-DefaultToLinux)) { return }
 
     Save-State -Mode "wsl" -Phase "done"
     Write-Summary -Mode "wsl"

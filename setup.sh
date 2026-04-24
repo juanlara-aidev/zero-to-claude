@@ -14,8 +14,17 @@ NEED_NEW_TERMINAL=false
 # Pre-flight detection results
 HAS_VERSION_MANAGER=false
 VERSION_MANAGER_NAME=""
+HAS_PY_VERSION_MANAGER=false
+PY_VERSION_MANAGER_NAME=""
 USER_SHELL=""
 USER_SHELL_PROFILE=""
+
+# Python config
+PYTHON_FORMULA="python@3.12"
+
+# State file (ownership tracking for uninstall)
+STATE_DIR="$HOME/.zero-claude"
+STATE_FILE="$STATE_DIR/state"
 
 # ═══════════════════════════════════════════════════════════════
 #  Colores y Formato
@@ -245,6 +254,37 @@ detect_user_shell() {
     print_success "Shell detectado: $USER_SHELL (profile: $USER_SHELL_PROFILE)"
 }
 
+# ═══════════════════════════════════════════════════════════════
+#  State file helpers (ownership tracking)
+# ═══════════════════════════════════════════════════════════════
+
+state_set() {
+    # state_set key value — idempotent upsert in ~/.zero-claude/state
+    local key="$1"
+    local value="$2"
+    mkdir -p "$STATE_DIR"
+    touch "$STATE_FILE"
+    if grep -q "^${key}=" "$STATE_FILE" 2>/dev/null; then
+        # Replace existing
+        local tmp; tmp="$(mktemp)"
+        grep -v "^${key}=" "$STATE_FILE" > "$tmp" 2>/dev/null || true
+        echo "${key}=${value}" >> "$tmp"
+        mv "$tmp" "$STATE_FILE"
+    else
+        echo "${key}=${value}" >> "$STATE_FILE"
+    fi
+}
+
+state_get() {
+    local key="$1"
+    [[ -f "$STATE_FILE" ]] || { echo ""; return; }
+    grep "^${key}=" "$STATE_FILE" 2>/dev/null | head -1 | cut -d= -f2-
+}
+
+state_clear() {
+    rm -rf "$STATE_DIR" 2>/dev/null
+}
+
 detect_version_managers() {
     print_step "Verificando version managers de Node.js..."
 
@@ -291,6 +331,60 @@ detect_version_managers() {
     print_success "No se detectaron version managers — Node.js se instalará vía Homebrew"
 }
 
+detect_python_version_managers() {
+    print_step "Verificando version managers de Python..."
+
+    # pyenv
+    if command_exists pyenv || [[ -d "$HOME/.pyenv" ]]; then
+        HAS_PY_VERSION_MANAGER=true
+        PY_VERSION_MANAGER_NAME="pyenv"
+        print_skip "Python gestionado por pyenv — se respeta tu instalación"
+        return
+    fi
+
+    # uv (Astral)
+    if command_exists uv; then
+        HAS_PY_VERSION_MANAGER=true
+        PY_VERSION_MANAGER_NAME="uv"
+        print_skip "Python gestionado por uv — se respeta tu instalación"
+        return
+    fi
+
+    # conda / mamba
+    if command_exists conda || command_exists mamba; then
+        HAS_PY_VERSION_MANAGER=true
+        PY_VERSION_MANAGER_NAME="conda"
+        print_skip "Python gestionado por conda/mamba — se respeta tu instalación"
+        return
+    fi
+
+    # asdf (también detectado para Node, pero puede gestionar Python)
+    if command_exists asdf && asdf plugin list 2>/dev/null | grep -q '^python$'; then
+        HAS_PY_VERSION_MANAGER=true
+        PY_VERSION_MANAGER_NAME="asdf"
+        print_skip "Python gestionado por asdf — se respeta tu instalación"
+        return
+    fi
+
+    # mise
+    if command_exists mise && mise ls python 2>/dev/null | grep -q .; then
+        HAS_PY_VERSION_MANAGER=true
+        PY_VERSION_MANAGER_NAME="mise"
+        print_skip "Python gestionado por mise — se respeta tu instalación"
+        return
+    fi
+
+    # rye
+    if command_exists rye; then
+        HAS_PY_VERSION_MANAGER=true
+        PY_VERSION_MANAGER_NAME="rye"
+        print_skip "Python gestionado por rye — se respeta tu instalación"
+        return
+    fi
+
+    print_success "No se detectaron version managers — Python se instalará vía Homebrew ($PYTHON_FORMULA)"
+}
+
 preflight_checks() {
     echo ""
     print_info "Ejecutando verificaciones previas..."
@@ -305,6 +399,7 @@ preflight_checks() {
     # Non-critical checks (warn and continue)
     detect_user_shell
     detect_version_managers
+    detect_python_version_managers
 
     echo ""
     print_success "Todas las verificaciones pasaron"
@@ -574,6 +669,61 @@ install_node() {
     fi
 }
 
+install_python() {
+    print_step "Verificando Python..."
+
+    # Respect user's version manager
+    if [[ "$HAS_PY_VERSION_MANAGER" == true ]]; then
+        if command_exists python3; then
+            print_skip "Python $(python3 --version 2>&1 | awk '{print $2}') (via $PY_VERSION_MANAGER_NAME) — se respeta tu instalación"
+        else
+            print_skip "Python gestionado por $PY_VERSION_MANAGER_NAME — se respeta tu instalación"
+        fi
+        ALREADY_INSTALLED+=("Python ($PY_VERSION_MANAGER_NAME)")
+        state_set python_channel "skipped-user-manager"
+        return 0
+    fi
+
+    # Check for an existing brew-managed python first (skip install if present)
+    local brew_python_installed=false
+    if command_exists brew && brew list "$PYTHON_FORMULA" &>/dev/null; then
+        brew_python_installed=true
+    fi
+
+    # NEVER touch /usr/bin/python3 (Apple system Python — externally-managed)
+    # We verify that python3 + pip3 work and come from brew; if not, we install via brew
+    if [[ "$brew_python_installed" == true ]] && command_exists python3 && python3 -m pip --version &>/dev/null && python3 -c "import venv" &>/dev/null; then
+        print_skip "Python ya instalado vía Homebrew ($(python3 --version 2>&1))"
+        ALREADY_INSTALLED+=("Python")
+        return 0
+    fi
+
+    print_step "Instalando Python ($PYTHON_FORMULA)..."
+    if ! command_exists brew; then
+        print_error "Homebrew no disponible — no se puede instalar Python"
+        print_info "Revisa errores de Homebrew arriba."
+        ERRORS+=("Python")
+        return 1
+    fi
+
+    brew install "$PYTHON_FORMULA"
+
+    # Verify install succeeded (python3 should resolve to the brew symlink)
+    if command_exists python3 && python3 -m pip --version &>/dev/null && python3 -c "import venv" &>/dev/null; then
+        print_success "Python instalado ($(python3 --version 2>&1))"
+        print_info "pip: $(python3 -m pip --version 2>&1 | awk '{print $1, $2}')"
+        INSTALLED+=("Python")
+        # Record ownership for uninstall
+        state_set python_installed_by_us 1
+        state_set python_channel brew
+        state_set python_formula "$PYTHON_FORMULA"
+    else
+        print_error "No se pudo instalar Python o verificar pip/venv"
+        print_info "Intenta manualmente: brew install $PYTHON_FORMULA"
+        ERRORS+=("Python")
+    fi
+}
+
 configure_claude_path() {
     # Persist ~/.local/bin in the user's shell profile so claude is available in new terminals
     local claude_path_line='export PATH="$HOME/.local/bin:$PATH"'
@@ -675,10 +825,12 @@ print_summary() {
 
     echo -e "  ${BOLD}📋 Versiones finales:${NC}"
     echo "  ─────────────────────────────────"
-    command_exists git    && echo "     Git:         $(git --version | sed 's/git version //')"
-    command_exists node   && echo "     Node.js:     $(node --version)"
-    command_exists npm    && echo "     npm:         $(npm --version)"
-    command_exists claude && echo "     Claude Code: $(claude --version 2>/dev/null || echo 'ver nueva terminal')"
+    command_exists git     && echo "     Git:         $(git --version | sed 's/git version //')"
+    command_exists node    && echo "     Node.js:     $(node --version)"
+    command_exists npm     && echo "     npm:         $(npm --version)"
+    command_exists python3 && echo "     Python:      $(python3 --version 2>&1)"
+    python3 -m pip --version &>/dev/null && echo "     pip:         $(python3 -m pip --version 2>&1 | awk '{print $1, $2}')"
+    command_exists claude  && echo "     Claude Code: $(claude --version 2>/dev/null || echo 'ver nueva terminal')"
     echo "  ─────────────────────────────────"
 
     echo ""
@@ -780,6 +932,40 @@ uninstall_node() {
         rm -rf "$HOME/.node_repl_history"
         print_skip "Node.js no encontrado"
         NOT_FOUND+=("Node.js")
+    fi
+}
+
+uninstall_python() {
+    print_step "Desinstalando Python..."
+
+    local owned
+    owned="$(state_get python_installed_by_us)"
+
+    if [[ "$owned" != "1" ]]; then
+        print_skip "Python no fue instalado por este script — no se toca"
+        print_info "(Si lo tenías antes o lo gestiona pyenv/uv/conda, queda intacto.)"
+        NOT_FOUND+=("Python (no era nuestro)")
+        return 0
+    fi
+
+    local brew_cmd=""
+    if command_exists brew; then
+        brew_cmd="brew"
+    elif [[ -f "$HOMEBREW_PREFIX/bin/brew" ]]; then
+        brew_cmd="$HOMEBREW_PREFIX/bin/brew"
+    fi
+
+    local formula
+    formula="$(state_get python_formula)"
+    [[ -z "$formula" ]] && formula="$PYTHON_FORMULA"
+
+    if [[ -n "$brew_cmd" ]] && $brew_cmd list "$formula" &>/dev/null; then
+        $brew_cmd uninstall --ignore-dependencies "$formula" 2>/dev/null || true
+        print_success "Python ($formula) eliminado"
+        REMOVED+=("Python")
+    else
+        print_skip "Python ($formula) no encontrado vía brew"
+        NOT_FOUND+=("Python")
     fi
 }
 
@@ -898,8 +1084,9 @@ run_uninstall() {
 
     echo ""
     echo -e "  ${RED}${BOLD}⚠️  MODO DESINSTALACIÓN${NC}"
-    echo -e "  ${RED}Se eliminarán: Claude Code, Node.js, Git (brew), Homebrew${NC}"
+    echo -e "  ${RED}Se eliminarán: Claude Code, Node.js, Python (si lo instaló este script), Git (brew), Homebrew${NC}"
     echo -e "  ${YELLOW}Xcode CLT NO se tocará (es parte del sistema base)${NC}"
+    echo -e "  ${YELLOW}Si tenías Python antes (pyenv/uv/conda/tu instalación previa), NO se toca${NC}"
     echo ""
     read -rp "  ¿Continuar? (s/N): " confirm
     if [[ "$confirm" != "s" && "$confirm" != "S" ]]; then
@@ -919,8 +1106,12 @@ run_uninstall() {
 
     uninstall_claude_code
     uninstall_node
+    uninstall_python
     uninstall_git
     uninstall_homebrew
+
+    # Clear local state file
+    state_clear
 
     print_uninstall_summary
 }
@@ -971,6 +1162,7 @@ main() {
 
     install_git
     install_node
+    install_python
     install_claude_code
 
     print_summary

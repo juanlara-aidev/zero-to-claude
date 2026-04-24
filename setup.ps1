@@ -1,4 +1,4 @@
-#Requires -Version 5.1
+﻿#Requires -Version 5.1
 $ErrorActionPreference = "Continue"
 
 # ═══════════════════════════════════════════════════════════════
@@ -11,9 +11,30 @@ $script:AlreadyInstalled = @()
 $script:NeedNewTerminal = $false
 $script:UseEmoji = $Host.UI.SupportsVirtualTerminal -or ($null -ne $env:WT_SESSION)
 
-# Pre-flight detection results
-$script:HasVersionManager = $false
-$script:VersionManagerName = ""
+# Version managers
+$script:HasNodeVersionManager = $false
+$script:NodeVersionManagerName = ""
+$script:HasPyVersionManager = $false
+$script:PyVersionManagerName = ""
+
+# State persistence
+$script:StateDir = Join-Path $env:LOCALAPPDATA "zero-claude"
+$script:StateFile = Join-Path $script:StateDir "state.json"
+$script:RegKey = "HKCU:\Software\ZeroClaude"
+
+# WSL config
+$script:WSLDistro = "Ubuntu"           # desired default distro
+$script:ActualDistro = $null           # detected/chosen distro at runtime (may differ if Ubuntu-24.04 etc)
+$script:WSLDefaultUser = "claudeuser"
+$script:HostWrapperDir = Join-Path $env:USERPROFILE ".local\bin"
+$script:HostWrapperPath = Join-Path $script:HostWrapperDir "claude.cmd"
+
+# Python config
+$script:PythonWingetId = "Python.Python.3.12"
+
+# Uninstall lists
+$script:Removed = @()
+$script:NotFound = @()
 
 # ═══════════════════════════════════════════════════════════════
 #  Colores y Formato
@@ -40,6 +61,7 @@ function Write-Header {
 }
 
 function Write-SystemInfo {
+    param([string]$Mode = "")
     $version = [System.Environment]::OSVersion.Version
     $currentDate = Get-Date -Format "yyyy-MM-dd"
     $psVersion = $PSVersionTable.PSVersion.ToString()
@@ -47,6 +69,7 @@ function Write-SystemInfo {
     Write-Host "  Sistema:  Windows (Build $($version.Build))" -ForegroundColor White
     Write-Host "  Shell:    PowerShell $psVersion" -ForegroundColor White
     Write-Host "  Fecha:    $currentDate" -ForegroundColor White
+    if ($Mode) { Write-Host "  Modo:     $Mode" -ForegroundColor White }
     Write-Host ""
 }
 
@@ -54,40 +77,28 @@ function Write-Separator {
     Write-Host "=======================================================" -ForegroundColor Cyan
 }
 
-function Write-Step {
-    param([string]$Message)
-    $icon = if ($script:UseEmoji) { "⏳" } else { "[...]" }
-    Write-Host "  $icon $Message" -ForegroundColor Yellow
-}
+function Write-Step { param([string]$Message); $i = if ($script:UseEmoji) { "⏳" } else { "[...]" }; Write-Host "  $i $Message" -ForegroundColor Yellow }
+function Write-Ok   { param([string]$Message); $i = if ($script:UseEmoji) { "✅" } else { "[OK]"   }; Write-Host "  $i $Message" -ForegroundColor Green }
+function Write-Skip { param([string]$Message); $i = if ($script:UseEmoji) { "⏭️ " } else { "[SKIP]" }; Write-Host "  $i $Message" -ForegroundColor Cyan }
+function Write-Err  { param([string]$Message); $i = if ($script:UseEmoji) { "❌" } else { "[ERROR]"}; Write-Host "  $i $Message" -ForegroundColor Red }
+function Write-Warn { param([string]$Message); $i = if ($script:UseEmoji) { "⚠️ " } else { "[WARN]" }; Write-Host "  $i $Message" -ForegroundColor Yellow }
+function Write-Info { param([string]$Message); $i = if ($script:UseEmoji) { "ℹ️ " } else { "[INFO]" }; Write-Host "  $i $Message" -ForegroundColor Blue }
 
-function Write-Ok {
-    param([string]$Message)
-    $icon = if ($script:UseEmoji) { "✅" } else { "[OK]" }
-    Write-Host "  $icon $Message" -ForegroundColor Green
-}
-
-function Write-Skip {
-    param([string]$Message)
-    $icon = if ($script:UseEmoji) { "⏭️ " } else { "[SKIP]" }
-    Write-Host "  $icon $Message" -ForegroundColor Cyan
-}
-
-function Write-Err {
-    param([string]$Message)
-    $icon = if ($script:UseEmoji) { "❌" } else { "[ERROR]" }
-    Write-Host "  $icon $Message" -ForegroundColor Red
-}
-
-function Write-Warn {
-    param([string]$Message)
-    $icon = if ($script:UseEmoji) { "⚠️ " } else { "[WARN]" }
-    Write-Host "  $icon $Message" -ForegroundColor Yellow
-}
-
-function Write-Info {
-    param([string]$Message)
-    $icon = if ($script:UseEmoji) { "ℹ️ " } else { "[INFO]" }
-    Write-Host "  $icon $Message" -ForegroundColor Blue
+function Write-RebootBanner {
+    Write-Host ""
+    Write-Host "  ===================================================================" -ForegroundColor Yellow
+    Write-Host "  ==                                                               ==" -ForegroundColor Yellow
+    Write-Host "  ==   SE REQUIERE REINICIAR WINDOWS PARA CONTINUAR                ==" -ForegroundColor Yellow
+    Write-Host "  ==                                                               ==" -ForegroundColor Yellow
+    Write-Host "  ==   1) Reinicia tu computadora.                                 ==" -ForegroundColor Yellow
+    Write-Host "  ==   2) Vuelve a correr EL MISMO comando:                        ==" -ForegroundColor Yellow
+    Write-Host "  ==      irm https://raw.githubusercontent.com/juanlara-aidev/    ==" -ForegroundColor Yellow
+    Write-Host "  ==      zero-to-claude/main/install.ps1 | iex                    ==" -ForegroundColor Yellow
+    Write-Host "  ==                                                               ==" -ForegroundColor Yellow
+    Write-Host "  ==   El instalador retomara donde quedo, automaticamente.        ==" -ForegroundColor Yellow
+    Write-Host "  ==                                                               ==" -ForegroundColor Yellow
+    Write-Host "  ===================================================================" -ForegroundColor Yellow
+    Write-Host ""
 }
 
 # ═══════════════════════════════════════════════════════════════
@@ -105,35 +116,158 @@ function Update-SessionPath {
     $env:Path = "$machinePath;$userPath"
 }
 
+function Test-IsAdmin {
+    $current = [Security.Principal.WindowsIdentity]::GetCurrent()
+    $principal = New-Object Security.Principal.WindowsPrincipal $current
+    return $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+}
+
 function Test-WindowsVersion {
     $version = [System.Environment]::OSVersion.Version
     if ($version.Major -lt 10) {
         Write-Err "Se requiere Windows 10+"; exit 1
     }
-    if ($version.Major -eq 10 -and $version.Build -lt 17763) {
-        Write-Err "Se requiere Windows 10 1809+ (Build 17763+). Build actual: $($version.Build)"
+    if ($version.Major -eq 10 -and $version.Build -lt 19041) {
+        Write-Err "Se requiere Windows 10 2004+ (Build 19041+) para WSL 2. Build actual: $($version.Build)"
+        Write-Info "Windows 10 1809 (17763+) es compatible con el modo --native, pero no con WSL."
         exit 1
     }
     Write-Ok "Windows (Build $($version.Build)) detectado"
 }
 
-function Test-Winget {
-    if (-not (Test-CommandExists "winget")) {
-        Write-Err "winget no encontrado."
-        Write-Info "Instala 'App Installer' desde Microsoft Store: https://aka.ms/getwinget"
-        exit 1
+# ═══════════════════════════════════════════════════════════════
+#  State Machine (persistencia)
+# ═══════════════════════════════════════════════════════════════
+
+function Ensure-StateDir {
+    if (-not (Test-Path $script:StateDir)) {
+        New-Item -ItemType Directory -Path $script:StateDir -Force | Out-Null
     }
-    Write-Ok "winget disponible"
+}
+
+function Read-State {
+    if (-not (Test-Path $script:StateFile)) { return $null }
+    try {
+        $content = Get-Content $script:StateFile -Raw -ErrorAction Stop
+        return $content | ConvertFrom-Json -ErrorAction Stop
+    } catch {
+        Write-Warn "state.json corrupto o ilegible — ignorando"
+        return $null
+    }
+}
+
+function Save-State {
+    param(
+        [string]$Phase,
+        [string]$Mode = "wsl",
+        [hashtable]$Artifacts = @{},
+        [string]$RepoName = "",
+        [string]$RepoBranch = ""
+    )
+    Ensure-StateDir
+
+    $existing = Read-State
+    $existingArtifacts = @{
+        wslFeature = $false
+        vmPlatformFeature = $false
+        ubuntu = $false
+        claudeCodeInWsl = $false
+        hostWrapper = $false
+        pythonInstalledByUs = $false
+        pythonChannel = $null
+        gitInstalledByUs = $false
+        nodeInstalledByUs = $false
+    }
+    if ($existing -and $existing.artifactsInstalled) {
+        foreach ($prop in $existing.artifactsInstalled.PSObject.Properties) {
+            $existingArtifacts[$prop.Name] = $prop.Value
+        }
+    }
+    foreach ($key in $Artifacts.Keys) {
+        $existingArtifacts[$key] = $Artifacts[$key]
+    }
+
+    $now = (Get-Date).ToString("o")
+    $startedAt = if ($existing -and $existing.startedAt) { $existing.startedAt } else { $now }
+
+    # Persist repo override for post-reboot resume
+    $savedRepo = if ($RepoName) { $RepoName } elseif ($existing -and $existing.repoName) { $existing.repoName } else { "" }
+    $savedBranch = if ($RepoBranch) { $RepoBranch } elseif ($existing -and $existing.repoBranch) { $existing.repoBranch } else { "" }
+
+    $distroName = if ($script:ActualDistro) { $script:ActualDistro } else { $script:WSLDistro }
+    $state = [ordered]@{
+        version = 1
+        mode = $Mode
+        phase = $Phase
+        distroName = $distroName
+        wslUser = $script:WSLDefaultUser
+        startedAt = $startedAt
+        updatedAt = $now
+        repoName = $savedRepo
+        repoBranch = $savedBranch
+        artifactsInstalled = $existingArtifacts
+    }
+
+    $json = $state | ConvertTo-Json -Depth 5
+    Set-Content -Path $script:StateFile -Value $json -Encoding UTF8
+
+    # Registry mirror (simple key)
+    try {
+        if (-not (Test-Path $script:RegKey)) {
+            New-Item -Path $script:RegKey -Force | Out-Null
+        }
+        Set-ItemProperty -Path $script:RegKey -Name "State" -Value $Phase
+        Set-ItemProperty -Path $script:RegKey -Name "Mode" -Value $Mode
+    } catch {
+        # Non-fatal
+    }
+}
+
+function Clear-State {
+    if (Test-Path $script:StateFile) {
+        Remove-Item $script:StateFile -Force -ErrorAction SilentlyContinue
+    }
+    if (Test-Path $script:StateDir) {
+        Remove-Item $script:StateDir -Recurse -Force -ErrorAction SilentlyContinue
+    }
+    try {
+        if (Test-Path $script:RegKey) {
+            Remove-Item $script:RegKey -Recurse -Force -ErrorAction SilentlyContinue
+        }
+    } catch {
+        # Non-fatal
+    }
+}
+
+function Get-InstallMode {
+    param([string[]]$CmdArgs)
+
+    # Uninstall mode
+    if ($CmdArgs -contains "--uninstall") { return "uninstall" }
+    if ($env:CLAUDE_SETUP_UNINSTALL -eq "1") { return "uninstall" }
+
+    # Resume mode (post-reboot or mid-install)
+    $state = Read-State
+    if ($state -and $state.phase -and $state.phase -ne "done") {
+        return "resume"
+    }
+
+    # Explicit native mode
+    if ($CmdArgs -contains "--native") { return "native" }
+    if ($env:CLAUDE_SETUP_NATIVE -eq "1") { return "native" }
+
+    # Default: WSL
+    return "wsl"
 }
 
 # ═══════════════════════════════════════════════════════════════
-#  Pre-flight Checks
+#  Pre-flight Checks (compartidos)
 # ═══════════════════════════════════════════════════════════════
 
 function Test-Internet {
     Write-Step "Verificando conexion a internet..."
     try {
-        $response = Invoke-WebRequest -Uri "https://github.com" -Method Head -TimeoutSec 10 -UseBasicParsing -ErrorAction Stop
+        $null = Invoke-WebRequest -Uri "https://github.com" -Method Head -TimeoutSec 10 -UseBasicParsing -ErrorAction Stop
         Write-Ok "Conexion a internet verificada"
     } catch {
         Write-Err "No se detecto conexion a internet."
@@ -144,40 +278,16 @@ function Test-Internet {
 }
 
 function Test-DiskSpace {
+    param([int]$MinGB = 10)
     Write-Step "Verificando espacio en disco..."
     $freeGB = [math]::Round((Get-PSDrive C).Free / 1GB, 1)
-    if ($freeGB -lt 5) {
+    if ($freeGB -lt $MinGB) {
         Write-Err "Espacio en disco insuficiente."
-        Write-Info "Disponible: $freeGB GB — Se requieren al menos 5 GB."
+        Write-Info "Disponible: $freeGB GB — Se requieren al menos $MinGB GB."
         Write-Info "Libera espacio y ejecuta el script de nuevo."
         exit 1
     }
     Write-Ok "Espacio en disco suficiente ($freeGB GB disponibles)"
-}
-
-function Test-WingetHealth {
-    Write-Step "Verificando que winget funciona correctamente..."
-    if (-not (Test-CommandExists "winget")) {
-        Write-Err "winget no encontrado."
-        Write-Info "Instala 'App Installer' desde Microsoft Store: https://aka.ms/getwinget"
-        exit 1
-    }
-
-    # Verify winget sources are healthy
-    try {
-        $null = winget source list 2>&1
-        if ($LASTEXITCODE -ne 0) { throw "winget source list failed" }
-        Write-Ok "winget disponible y funcional"
-    } catch {
-        Write-Warn "winget sources pueden estar corruptas. Intentando reparar..."
-        try {
-            winget source reset --force 2>&1 | Out-Null
-            Write-Ok "winget sources reparadas"
-        } catch {
-            Write-Warn "No se pudieron reparar winget sources (puede requerir admin)."
-            Write-Info "Si la instalacion falla, ejecuta como admin: winget source reset --force"
-        }
-    }
 }
 
 function Test-PathLength {
@@ -192,49 +302,167 @@ function Test-PathLength {
     }
 }
 
-function Test-VersionManagers {
-    Write-Step "Verificando version managers de Node.js..."
+function Test-AdminRequired {
+    if (-not (Test-IsAdmin)) {
+        Write-Err "Se requiere PowerShell como Administrador."
+        Write-Info "Cierra esta ventana, abre PowerShell como Administrador (click derecho"
+        Write-Info "-> 'Ejecutar como administrador') y vuelve a correr el comando."
+        exit 1
+    }
+    Write-Ok "PowerShell corriendo como Administrador"
+}
 
-    # nvm-windows
+function Test-Virtualization {
+    Write-Step "Verificando soporte de virtualizacion..."
+    try {
+        $cpu = Get-CimInstance -ClassName Win32_Processor -ErrorAction Stop | Select-Object -First 1
+        $isVM = $false
+        $vmVendor = ""
+        try {
+            $sys = Get-CimInstance -ClassName Win32_ComputerSystem -ErrorAction Stop
+            $vmVendor = "$($sys.Manufacturer) $($sys.Model)"
+            $isVM = ($sys.Manufacturer -match 'Parallels|VMware|innotek|Xen|QEMU|Microsoft Corporation' -or
+                     $sys.Model -match 'Virtual|KVM|BHYVE')
+        } catch {}
+
+        if ($cpu.VirtualizationFirmwareEnabled -eq $true) {
+            Write-Ok "Virtualizacion habilitada en BIOS/UEFI"
+        } elseif ($isVM) {
+            Write-Warn "Host virtualizado detectado ($vmVendor). CIM reporta virt=disabled pero nested virt suele funcionar — continuando."
+        } elseif ($env:CLAUDE_SETUP_SKIP_VIRT_CHECK -eq "1") {
+            Write-Warn "CLAUDE_SETUP_SKIP_VIRT_CHECK=1 — continuando sin verificar virtualizacion"
+        } else {
+            Write-Err "La virtualizacion parece DESHABILITADA en el BIOS/UEFI."
+            Write-Info "WSL 2 requiere virtualizacion (Intel VT-x o AMD-V) habilitada."
+            Write-Info "Entra al BIOS/UEFI y habilita 'Virtualization Technology' o 'SVM Mode'."
+            Write-Info "Si prefieres instalar sin WSL, usa: `$env:CLAUDE_SETUP_NATIVE='1'; irm ... | iex"
+            Write-Info "Para saltar esta verificacion: `$env:CLAUDE_SETUP_SKIP_VIRT_CHECK='1'"
+            exit 1
+        }
+    } catch {
+        Write-Warn "No se pudo verificar virtualizacion via CIM — continuando"
+    }
+}
+
+function Test-WingetHealth {
+    param([switch]$Fatal)
+    Write-Step "Verificando que winget funciona correctamente..."
+    if (-not (Test-CommandExists "winget")) {
+        if ($Fatal) {
+            Write-Err "winget no encontrado."
+            Write-Info "Instala 'App Installer' desde Microsoft Store: https://aka.ms/getwinget"
+            exit 1
+        } else {
+            Write-Warn "winget no encontrado (no critico en modo WSL)"
+            return
+        }
+    }
+    try {
+        $null = winget source list 2>&1
+        if ($LASTEXITCODE -ne 0) { throw "winget source list failed" }
+        Write-Ok "winget disponible y funcional"
+    } catch {
+        Write-Warn "winget sources pueden estar corruptas. Intentando reparar..."
+        try {
+            winget source reset --force 2>&1 | Out-Null
+            Write-Ok "winget sources reparadas"
+        } catch {
+            Write-Warn "No se pudieron reparar winget sources."
+        }
+    }
+}
+
+function Test-NodeVersionManagers {
+    Write-Step "Verificando version managers de Node.js..."
     if ($env:NVM_HOME -or (Test-CommandExists "nvm")) {
-        $script:HasVersionManager = $true
-        $script:VersionManagerName = "nvm"
+        $script:HasNodeVersionManager = $true
+        $script:NodeVersionManagerName = "nvm"
         Write-Skip "Node.js gestionado por nvm — se respeta tu instalacion"
         return
     }
-
-    # fnm
     if (Test-CommandExists "fnm") {
-        $script:HasVersionManager = $true
-        $script:VersionManagerName = "fnm"
+        $script:HasNodeVersionManager = $true
+        $script:NodeVersionManagerName = "fnm"
         Write-Skip "Node.js gestionado por fnm — se respeta tu instalacion"
         return
     }
-
-    # volta
     if ((Test-CommandExists "volta") -or $env:VOLTA_HOME) {
-        $script:HasVersionManager = $true
-        $script:VersionManagerName = "volta"
+        $script:HasNodeVersionManager = $true
+        $script:NodeVersionManagerName = "volta"
         Write-Skip "Node.js gestionado por volta — se respeta tu instalacion"
         return
     }
-
     Write-Ok "No se detectaron version managers — Node.js se instalara via winget"
 }
 
+function Test-PyVersionManagers {
+    Write-Step "Verificando version managers de Python..."
+    # pyenv-win
+    if ($env:PYENV -or (Test-CommandExists "pyenv")) {
+        $script:HasPyVersionManager = $true
+        $script:PyVersionManagerName = "pyenv"
+        Write-Skip "Python gestionado por pyenv — se respeta tu instalacion"
+        return
+    }
+    # uv (Astral)
+    if (Test-CommandExists "uv") {
+        $script:HasPyVersionManager = $true
+        $script:PyVersionManagerName = "uv"
+        Write-Skip "Python gestionado por uv — se respeta tu instalacion"
+        return
+    }
+    # conda / mamba
+    if ((Test-CommandExists "conda") -or (Test-CommandExists "mamba")) {
+        $script:HasPyVersionManager = $true
+        $script:PyVersionManagerName = "conda"
+        Write-Skip "Python gestionado por conda/mamba — se respeta tu instalacion"
+        return
+    }
+    # asdf
+    if (Test-CommandExists "asdf") {
+        $script:HasPyVersionManager = $true
+        $script:PyVersionManagerName = "asdf"
+        Write-Skip "Python gestionado por asdf — se respeta tu instalacion"
+        return
+    }
+    # mise
+    if (Test-CommandExists "mise") {
+        $script:HasPyVersionManager = $true
+        $script:PyVersionManagerName = "mise"
+        Write-Skip "Python gestionado por mise — se respeta tu instalacion"
+        return
+    }
+    # rye
+    if (Test-CommandExists "rye") {
+        $script:HasPyVersionManager = $true
+        $script:PyVersionManagerName = "rye"
+        Write-Skip "Python gestionado por rye — se respeta tu instalacion"
+        return
+    }
+    Write-Ok "No se detectaron version managers de Python"
+}
+
 function Test-Preflight {
+    param([string]$Mode)
     Write-Host ""
     Write-Info "Ejecutando verificaciones previas..."
     Write-Host ""
 
-    # Critical checks (abort on failure)
     Test-Internet
-    Test-DiskSpace
-    Test-WingetHealth
+    if ($Mode -eq "wsl") {
+        Test-DiskSpace -MinGB 10
+        Test-AdminRequired
+        Test-Virtualization
+    } else {
+        Test-DiskSpace -MinGB 5
+        Test-WingetHealth -Fatal
+    }
 
-    # Non-critical checks (warn and continue)
     Test-PathLength
-    Test-VersionManagers
+    if ($Mode -eq "native") {
+        Test-NodeVersionManagers
+        Test-PyVersionManagers
+    }
 
     Write-Host ""
     Write-Ok "Todas las verificaciones pasaron"
@@ -242,7 +470,457 @@ function Test-Preflight {
 }
 
 # ═══════════════════════════════════════════════════════════════
-#  Funciones de Instalación
+#  WSL Mode — Fase A: Habilitacion de WSL
+# ═══════════════════════════════════════════════════════════════
+
+function Test-WSLInstalled {
+    # WSL is considered installed if `wsl --status` succeeds AND the kernel is initialized
+    if (-not (Test-CommandExists "wsl")) { return $false }
+    try {
+        $statusOutput = wsl --status 2>&1
+        if ($LASTEXITCODE -ne 0) { return $false }
+        # Accept both localized outputs; presence of a line with "Default Version" or "Version" is a good sign
+        return $true
+    } catch {
+        return $false
+    }
+}
+
+function Test-FeatureEnabled {
+    param([string]$FeatureName)
+    try {
+        $f = Get-WindowsOptionalFeature -Online -FeatureName $FeatureName -ErrorAction Stop
+        return ($f.State -eq "Enabled")
+    } catch {
+        return $false
+    }
+}
+
+function Test-FeaturePending {
+    param([string]$FeatureName)
+    try {
+        $f = Get-WindowsOptionalFeature -Online -FeatureName $FeatureName -ErrorAction Stop
+        return ($f.State -eq "EnablePending")
+    } catch {
+        return $false
+    }
+}
+
+function Invoke-PhaseA-EnableWSL {
+    Write-Separator
+    Write-Host "  Fase A: Habilitacion de WSL 2" -ForegroundColor Cyan
+    Write-Separator
+    Write-Host ""
+
+    $wslFeat = "Microsoft-Windows-Subsystem-Linux"
+    $vmpFeat = "VirtualMachinePlatform"
+
+    $wslEnabled = Test-FeatureEnabled $wslFeat
+    $vmpEnabled = Test-FeatureEnabled $vmpFeat
+
+    if ($wslEnabled -and $vmpEnabled -and (Test-WSLInstalled)) {
+        Write-Skip "WSL 2 ya esta habilitado y funcional"
+        Save-State -Phase "installing-ubuntu" -Artifacts @{ wslFeature = $true; vmPlatformFeature = $true }
+        return $true
+    }
+
+    $needReboot = $false
+
+    if (-not $wslEnabled) {
+        Write-Step "Habilitando feature: $wslFeat..."
+        try {
+            $r = Enable-WindowsOptionalFeature -Online -FeatureName $wslFeat -All -NoRestart -ErrorAction Stop
+            if ($r.RestartNeeded) { $needReboot = $true }
+            Write-Ok "$wslFeat habilitado"
+        } catch {
+            Write-Err "No se pudo habilitar ${wslFeat}: $_"
+            $script:Errors += "WSL feature"
+            return $false
+        }
+    } else {
+        Write-Skip "$wslFeat ya habilitado"
+    }
+
+    if (-not $vmpEnabled) {
+        Write-Step "Habilitando feature: $vmpFeat..."
+        try {
+            $r = Enable-WindowsOptionalFeature -Online -FeatureName $vmpFeat -All -NoRestart -ErrorAction Stop
+            if ($r.RestartNeeded) { $needReboot = $true }
+            Write-Ok "$vmpFeat habilitado"
+        } catch {
+            Write-Err "No se pudo habilitar ${vmpFeat}: $_"
+            $script:Errors += "VirtualMachinePlatform feature"
+            return $false
+        }
+    } else {
+        Write-Skip "$vmpFeat ya habilitado"
+    }
+
+    # Check pending state (post-cmdlet)
+    if ((Test-FeaturePending $wslFeat) -or (Test-FeaturePending $vmpFeat)) {
+        $needReboot = $true
+    }
+
+    Save-State -Phase "awaiting-reboot" -Artifacts @{
+        wslFeature = $true
+        vmPlatformFeature = $true
+    }
+
+    if ($needReboot) {
+        Write-RebootBanner
+        Write-Host ""
+        if ($env:CLAUDE_SETUP_NO_PROMPT -eq "1") {
+            Write-Info "CLAUDE_SETUP_NO_PROMPT=1 — no se prompteara; reinicia manualmente."
+        } elseif ($env:CLAUDE_SETUP_AUTO_REBOOT -eq "1") {
+            Write-Info "CLAUDE_SETUP_AUTO_REBOOT=1 — reiniciando Windows en 5s..."
+            Start-Sleep -Seconds 5
+            Restart-Computer -Force
+        } else {
+            $resp = Read-Host "  Reiniciar ahora? (s/N)"
+            if ($resp -eq "s" -or $resp -eq "S") {
+                Write-Info "Reiniciando Windows..."
+                Start-Sleep -Seconds 2
+                Restart-Computer -Force
+            } else {
+                Write-Info "Reinicia manualmente cuando puedas y vuelve a correr el comando."
+            }
+        }
+        exit 0
+    }
+
+    # Try to set WSL 2 as default (requires kernel). Wrap with 30s timeout —
+    # on some builds `wsl --set-default-version 2` hangs silently trying to
+    # update the kernel via Store before the Linux kernel is installed.
+    Write-Step "Configurando WSL 2 como version por defecto..."
+    try {
+        $p = Start-Process -FilePath "wsl.exe" `
+            -ArgumentList "--set-default-version","2" `
+            -NoNewWindow -PassThru `
+            -RedirectStandardOutput "NUL" -RedirectStandardError "NUL"
+        if (-not $p.WaitForExit(30000)) {
+            try { $p.Kill() } catch { }
+            Write-Warn "wsl --set-default-version 2 timeout (30s) — reintentamos luego"
+        } elseif ($p.ExitCode -eq 0) {
+            Write-Ok "WSL 2 configurado como default"
+        } else {
+            Write-Warn "No se pudo configurar WSL 2 como default (exit=$($p.ExitCode)) — reintentamos luego"
+        }
+    } catch {
+        Write-Warn "wsl command no disponible: $_"
+    }
+
+    Save-State -Phase "installing-ubuntu"
+    return $true
+}
+
+# ═══════════════════════════════════════════════════════════════
+#  WSL Mode — Fase B: Instalacion de Ubuntu
+# ═══════════════════════════════════════════════════════════════
+
+function Get-InstalledUbuntuDistro {
+    # Returns the name of an Ubuntu-family distro if installed, else $null.
+    # Detects "Ubuntu", "Ubuntu-22.04", "Ubuntu-24.04", etc. — preferring exact "Ubuntu".
+    try {
+        $raw = wsl.exe -l -q 2>&1
+        if ($LASTEXITCODE -ne 0) { return $null }
+        $text = ($raw -join "`n") -replace "`0", "" -replace "`r", ""
+        $names = $text -split "`n" | ForEach-Object { $_.Trim() } | Where-Object { $_ -ne "" }
+
+        # Prefer exact "Ubuntu"
+        foreach ($n in $names) {
+            if ($n -ieq $script:WSLDistro) { return $n }
+        }
+        # Else accept any Ubuntu-family variant
+        foreach ($n in $names) {
+            if ($n -imatch '^Ubuntu') { return $n }
+        }
+        return $null
+    } catch { return $null }
+}
+
+function Test-UbuntuInstalled {
+    return ($null -ne (Get-InstalledUbuntuDistro))
+}
+
+function Invoke-WSL-AsRoot {
+    param([string]$Command)
+    $distro = if ($script:ActualDistro) { $script:ActualDistro } else { $script:WSLDistro }
+    $output = wsl.exe -d $distro -u root -- bash -c $Command 2>&1
+    return @{ ExitCode = $LASTEXITCODE; Output = $output }
+}
+
+function Invoke-WSL-AsUser {
+    param([string]$Command)
+    $distro = if ($script:ActualDistro) { $script:ActualDistro } else { $script:WSLDistro }
+    $output = wsl.exe -d $distro -u $script:WSLDefaultUser -- bash -c $Command 2>&1
+    return @{ ExitCode = $LASTEXITCODE; Output = $output }
+}
+
+function Invoke-PhaseB-InstallUbuntu {
+    Write-Separator
+    Write-Host "  Fase B: Instalacion de Ubuntu en WSL" -ForegroundColor Cyan
+    Write-Separator
+    Write-Host ""
+
+    $existingDistro = Get-InstalledUbuntuDistro
+    if ($existingDistro) {
+        $script:ActualDistro = $existingDistro
+        if ($existingDistro -ieq $script:WSLDistro) {
+            Write-Skip "Distro '$existingDistro' ya instalada — se reutiliza"
+        } else {
+            Write-Skip "Distro Ubuntu-familia detectada: '$existingDistro' — se reutiliza en vez de instalar '$($script:WSLDistro)'"
+        }
+    } else {
+        $script:ActualDistro = $script:WSLDistro
+        Write-Step "Instalando Ubuntu (puede tardar varios minutos)..."
+        $installed = $false
+
+        # Strategy 1: modern wsl --install (Win 11 / Win 10 21H2+)
+        try {
+            wsl.exe --install -d $script:WSLDistro --no-launch 2>&1 | Out-Null
+            if ($LASTEXITCODE -eq 0) { $installed = $true }
+        } catch {
+            # fall through
+        }
+
+        # Strategy 2: --web-download fallback (if Store is blocked)
+        if (-not $installed) {
+            Write-Warn "wsl --install fallo — reintentando con --web-download"
+            try {
+                wsl.exe --install -d $script:WSLDistro --no-launch --web-download 2>&1 | Out-Null
+                if ($LASTEXITCODE -eq 0) { $installed = $true }
+            } catch {
+                # fall through
+            }
+        }
+
+        if (-not $installed) {
+            Write-Err "No se pudo instalar Ubuntu automaticamente."
+            Write-Info "Posibles causas:"
+            Write-Info "  - Microsoft Store bloqueado por politica corporativa"
+            Write-Info "  - Antivirus bloqueando la descarga del kernel/distro"
+            Write-Info "  - Conexion intermitente"
+            Write-Info "Intenta manualmente: wsl --install -d Ubuntu"
+            $script:Errors += "Ubuntu"
+            return $false
+        }
+
+        Write-Ok "Ubuntu instalado (sin primera ejecucion)"
+        Save-State -Phase "configuring-ubuntu" -Artifacts @{ ubuntu = $true }
+
+        # Give the distro a moment to register
+        Start-Sleep -Seconds 3
+    }
+
+    # Resolve which user to use. Priority:
+    #   1. Existing DefaultUid in registry (respects user's current setup)
+    #   2. Any existing human user (uid >= 1000) in /home
+    #   3. Create a new "claudeuser"
+    $detectedUser = $null
+    try {
+        $distroKey = Get-ChildItem "HKCU:\Software\Microsoft\Windows\CurrentVersion\Lxss" -ErrorAction SilentlyContinue | Where-Object {
+            (Get-ItemProperty $_.PSPath -Name DistributionName -ErrorAction SilentlyContinue).DistributionName -eq $script:ActualDistro
+        } | Select-Object -First 1
+        if ($distroKey) {
+            $defaultUid = (Get-ItemProperty $distroKey.PSPath -Name DefaultUid -ErrorAction SilentlyContinue).DefaultUid
+            if ($defaultUid -and $defaultUid -ge 1000) {
+                $r = Invoke-WSL-AsRoot "getent passwd $defaultUid | cut -d: -f1"
+                $candidate = ($r.Output -join "").Trim()
+                if ($candidate -and $candidate -ne "root") { $detectedUser = $candidate }
+            }
+        }
+    } catch { }
+
+    if (-not $detectedUser) {
+        # List human users (uid 1000-65533) and take the first non-root one
+        $cmd = 'getent passwd | while IFS=: read u x uid rest; do if [ "$uid" -ge 1000 ] && [ "$uid" -lt 65534 ]; then echo "$u"; break; fi; done'
+        $r = Invoke-WSL-AsRoot $cmd
+        $candidate = ($r.Output -join "`n" -split "`n" | Where-Object { $_ -match '^\S+$' } | Select-Object -First 1)
+        if ($candidate -and $candidate -ne "root") { $detectedUser = $candidate.Trim() }
+    }
+
+    if ($detectedUser -and $detectedUser -ne $script:WSLDefaultUser) {
+        Write-Skip "Usuario existente detectado: '$detectedUser' — se respeta tu instalacion"
+        $script:WSLDefaultUser = $detectedUser
+        # Make sure they have NOPASSWD sudo for our automated apt calls
+        $r = Invoke-WSL-AsRoot "usermod -aG sudo '$detectedUser' 2>/dev/null; echo '$detectedUser ALL=(ALL) NOPASSWD:ALL' > /etc/sudoers.d/90-$detectedUser && chmod 0440 /etc/sudoers.d/90-$detectedUser && echo 'sudo-granted'"
+        if (($r.Output -join "") -match "sudo-granted") {
+            Write-Ok "Sudo NOPASSWD garantizado para '$detectedUser'"
+        }
+    } else {
+        Write-Step "Configurando usuario '$($script:WSLDefaultUser)' en Ubuntu..."
+        $createUserScript = @"
+set -e
+if id '$($script:WSLDefaultUser)' &>/dev/null; then
+  echo 'user-exists'
+else
+  useradd -m -s /bin/bash -G sudo '$($script:WSLDefaultUser)'
+  echo '$($script:WSLDefaultUser) ALL=(ALL) NOPASSWD:ALL' > /etc/sudoers.d/90-$($script:WSLDefaultUser)
+  chmod 0440 /etc/sudoers.d/90-$($script:WSLDefaultUser)
+  echo 'user-created'
+fi
+"@
+        $r = Invoke-WSL-AsRoot $createUserScript
+        if ($r.ExitCode -ne 0) {
+            Write-Err "No se pudo crear el usuario en Ubuntu."
+            Write-Info "Salida: $($r.Output)"
+            $script:Errors += "Ubuntu user"
+            return $false
+        }
+        Write-Ok "Usuario '$($script:WSLDefaultUser)' listo"
+    }
+
+    # Set default user via registry (works for any distro)
+    try {
+        $distroKey = Get-ChildItem "HKCU:\Software\Microsoft\Windows\CurrentVersion\Lxss" -ErrorAction SilentlyContinue | Where-Object {
+            (Get-ItemProperty $_.PSPath -Name DistributionName -ErrorAction SilentlyContinue).DistributionName -eq $script:ActualDistro
+        } | Select-Object -First 1
+
+        if ($distroKey) {
+            # Resolve UID from inside the distro
+            $uidResult = Invoke-WSL-AsRoot "id -u '$($script:WSLDefaultUser)'"
+            $uid = ($uidResult.Output -replace "[^\d]", "") -as [int]
+            if ($uid -and $uid -gt 0) {
+                Set-ItemProperty -Path $distroKey.PSPath -Name "DefaultUid" -Value $uid -Type DWord
+                Write-Ok "Usuario default de Ubuntu configurado a '$($script:WSLDefaultUser)' (uid=$uid)"
+            }
+        }
+    } catch {
+        Write-Warn "No se pudo fijar el default user via registry (no critico)"
+    }
+
+    # Terminate + restart distro to apply default user
+    wsl.exe --terminate $script:ActualDistro 2>&1 | Out-Null
+
+    # Update package lists
+    Write-Step "Actualizando lista de paquetes de Ubuntu (apt update)..."
+    $aptUpdate = Invoke-WSL-AsRoot "DEBIAN_FRONTEND=noninteractive apt-get update -qq"
+    if ($aptUpdate.ExitCode -ne 0) {
+        Write-Warn "apt-get update devolvio errores (no critico):"
+        Write-Warn "$($aptUpdate.Output)"
+    } else {
+        Write-Ok "apt sources actualizadas"
+    }
+
+    Save-State -Phase "installing-in-wsl" -Artifacts @{ ubuntu = $true }
+    return $true
+}
+
+# ═══════════════════════════════════════════════════════════════
+#  WSL Mode — Fase C: Instalar Git, Node, Python, Claude dentro de WSL
+# ═══════════════════════════════════════════════════════════════
+
+function Invoke-PhaseC-InstallInWSL {
+    Write-Separator
+    Write-Host "  Fase C: Instalacion de Git, Node, Python y Claude Code en WSL" -ForegroundColor Cyan
+    Write-Separator
+    Write-Host ""
+
+    # Run setup-wsl.sh inside WSL. Source priority:
+    # 1. Local file via ZERO_CLAUDE_SETUPWSL_PATH (Windows path, translated to /mnt/c/...)
+    # 2. Remote repo (ZERO_CLAUDE_REPO/ZERO_CLAUDE_BRANCH override, default zero-to-claude/main)
+    $wslCmd = $null
+    if ($env:ZERO_CLAUDE_SETUPWSL_PATH -and (Test-Path $env:ZERO_CLAUDE_SETUPWSL_PATH)) {
+        $winPath = (Resolve-Path $env:ZERO_CLAUDE_SETUPWSL_PATH).Path
+        # Translate C:\foo\bar to /mnt/c/foo/bar
+        $driveLetter = $winPath.Substring(0,1).ToLower()
+        $pathPart = $winPath.Substring(2) -replace '\\', '/'
+        $wslPath = "/mnt/$driveLetter$pathPart"
+        Write-Info "Fuente (local): $winPath -> $wslPath"
+        $wslCmd = "bash $wslPath"
+    } else {
+        $repoName = if ($env:ZERO_CLAUDE_REPO) { $env:ZERO_CLAUDE_REPO } else { "zero-to-claude" }
+        $repoBranch = if ($env:ZERO_CLAUDE_BRANCH) { $env:ZERO_CLAUDE_BRANCH } else { "main" }
+        $repoUrl = "https://raw.githubusercontent.com/juanlara-aidev/$repoName/$repoBranch"
+        $wslCmd = "curl -fsSL $repoUrl/setup-wsl.sh | bash"
+        Write-Info "Fuente (remota): $repoUrl/setup-wsl.sh"
+    }
+
+    Write-Step "Descargando y ejecutando setup-wsl.sh dentro de Ubuntu..."
+    Write-Info "Esto instalara: git, node, python3 + pip + venv, claude code"
+    Write-Host ""
+
+    # Stream output directly (don't capture — user should see progress)
+    wsl.exe -d $script:ActualDistro -u $script:WSLDefaultUser -- bash -c $wslCmd
+    $exit = $LASTEXITCODE
+
+    Write-Host ""
+    if ($exit -ne 0) {
+        Write-Err "setup-wsl.sh devolvio exit code $exit"
+        Write-Info "Puedes reintentar corriendo el mismo comando, o entrar a WSL:"
+        Write-Info "  wsl -d $($script:ActualDistro)"
+        Write-Info "  bash <(curl -fsSL $repoUrl/setup-wsl.sh)"
+        $script:Errors += "setup-wsl.sh"
+        return $false
+    }
+
+    Write-Ok "Stack de desarrollo instalado dentro de Ubuntu"
+    Save-State -Phase "host-wrapper" -Artifacts @{
+        claudeCodeInWsl = $true
+        gitInstalledByUs = $true
+        nodeInstalledByUs = $true
+        pythonInstalledByUs = $true
+        pythonChannel = "apt"
+    }
+    return $true
+}
+
+# ═══════════════════════════════════════════════════════════════
+#  WSL Mode — Fase D: Integracion host <-> WSL
+# ═══════════════════════════════════════════════════════════════
+
+function Invoke-PhaseD-HostWrapper {
+    Write-Separator
+    Write-Host "  Fase D: Integracion host <-> WSL (wrapper claude.cmd)" -ForegroundColor Cyan
+    Write-Separator
+    Write-Host ""
+
+    Write-Step "Creando wrapper de claude en el host..."
+
+    if (-not (Test-Path $script:HostWrapperDir)) {
+        New-Item -ItemType Directory -Path $script:HostWrapperDir -Force | Out-Null
+    }
+
+    # Use absolute path inside WSL (wsl.exe -- <cmd> does NOT source ~/.bashrc,
+    # so ~/.local/bin is not in PATH unless we give the full path)
+    $claudeInWsl = "/home/$($script:WSLDefaultUser)/.local/bin/claude"
+    $wrapperLines = @(
+        "@echo off"
+        "REM Auto-generated by zero-claude (WSL mode). Forwards args to claude inside WSL."
+        "wsl.exe -d $($script:ActualDistro) --exec $claudeInWsl %*"
+    )
+    $wrapperContent = $wrapperLines -join "`r`n"
+
+    Set-Content -Path $script:HostWrapperPath -Value $wrapperContent -Encoding ASCII
+    Write-Ok "Wrapper creado: $($script:HostWrapperPath)"
+
+    # Add .local\bin to user PATH if not already present
+    $userPath = [System.Environment]::GetEnvironmentVariable("Path", "User")
+    if ($userPath -notmatch [regex]::Escape($script:HostWrapperDir)) {
+        $newPath = "$($script:HostWrapperDir);$userPath"
+        if ($newPath.Length -gt 2048) {
+            Write-Warn "Agregar el wrapper al PATH excederia 2048 caracteres ($($newPath.Length))."
+            Write-Info "Agrega manualmente: $($script:HostWrapperDir)"
+        } else {
+            [System.Environment]::SetEnvironmentVariable("Path", $newPath, "User")
+            Write-Ok "PATH del usuario actualizado con $($script:HostWrapperDir)"
+            $script:NeedNewTerminal = $true
+        }
+    } else {
+        Write-Skip "PATH del usuario ya contenia $($script:HostWrapperDir)"
+    }
+
+    # Update session PATH too
+    if ($env:Path -notmatch [regex]::Escape($script:HostWrapperDir)) {
+        $env:Path = "$($script:HostWrapperDir);$env:Path"
+    }
+
+    Save-State -Phase "done" -Artifacts @{ hostWrapper = $true }
+    return $true
+}
+
+# ═══════════════════════════════════════════════════════════════
+#  Native Mode (legacy) — instalacion en Windows nativo
 # ═══════════════════════════════════════════════════════════════
 
 function Install-GitForWindows {
@@ -260,7 +938,6 @@ function Install-GitForWindows {
         winget install Git.Git --accept-package-agreements --accept-source-agreements --silent
         Update-SessionPath
 
-        # Si git no esta en PATH despues de instalar, agregarlo manualmente
         if (-not (Test-CommandExists "git")) {
             $gitDir = "C:\Program Files\Git\cmd"
             if (Test-Path "$gitDir\git.exe") {
@@ -273,14 +950,12 @@ function Install-GitForWindows {
             Write-Ok "Git instalado ($(git --version))"
             $script:Installed += "Git"
             $script:NeedNewTerminal = $true
+            Save-State -Mode "native" -Phase "installing-native" -Artifacts @{ gitInstalledByUs = $true }
         } else { throw "Git no encontrado post-install" }
     }
     catch {
         Write-Err "No se pudo instalar Git: $_"
-        Write-Info "Si la descarga fallo, verifica tu conexion o configura HTTP_PROXY/HTTPS_PROXY."
-        Write-Info "Si winget fallo, intenta: winget source reset --force"
         Write-Info "Descarga manual: https://git-scm.com/downloads/win"
-        Write-Info "IMPORTANTE: Marca 'Add Git to PATH' durante instalacion"
         $script:Errors += "Git"
     }
 }
@@ -288,21 +963,17 @@ function Install-GitForWindows {
 function Install-NodeJS {
     Write-Step "Verificando Node.js..."
 
-    # Skip if a version manager is managing Node.js
-    if ($script:HasVersionManager) {
+    if ($script:HasNodeVersionManager) {
         if (Test-CommandExists "node") {
-            Write-Skip "Node.js $(node --version) detectado (gestionado por $($script:VersionManagerName)) — se respeta tu instalacion"
+            Write-Skip "Node.js $(node --version) detectado (gestionado por $($script:NodeVersionManagerName)) — se respeta tu instalacion"
         } else {
-            Write-Skip "Node.js gestionado por $($script:VersionManagerName) (no activo en esta sesion) — se respeta tu instalacion"
-            Write-Info "Asegurate de activar una version de Node.js con $($script:VersionManagerName) antes de usar npm"
+            Write-Skip "Node.js gestionado por $($script:NodeVersionManagerName) (no activo en esta sesion)"
         }
-        $script:AlreadyInstalled += "Node.js ($($script:VersionManagerName))"
+        $script:AlreadyInstalled += "Node.js ($($script:NodeVersionManagerName))"
         return
     }
 
-    # Check both command in PATH and file on disk
     if (-not (Test-CommandExists "node") -and (Test-Path "C:\Program Files\nodejs\node.exe")) {
-        # Node exists but not in session PATH — add it
         $env:Path = "C:\Program Files\nodejs;$env:Path"
     }
 
@@ -317,11 +988,9 @@ function Install-NodeJS {
         winget install OpenJS.NodeJS.LTS --accept-package-agreements --accept-source-agreements --silent
         Update-SessionPath
 
-        # Si node no esta en PATH despues de instalar, agregarlo manualmente
         if (-not (Test-CommandExists "node")) {
             $nodeDir = "C:\Program Files\nodejs"
             if (Test-Path "$nodeDir\node.exe") {
-                # Agregar a sesion actual
                 $env:Path = "$nodeDir;$env:Path"
                 Write-Info "Node.js agregado al PATH de la sesion actual"
             }
@@ -331,13 +1000,63 @@ function Install-NodeJS {
             Write-Ok "Node.js instalado ($(node --version))"
             $script:Installed += "Node.js"
             $script:NeedNewTerminal = $true
+            Save-State -Mode "native" -Phase "installing-native" -Artifacts @{ nodeInstalledByUs = $true }
         } else { throw "Node.js no encontrado post-install" }
     }
     catch {
         Write-Err "No se pudo instalar Node.js: $_"
-        Write-Info "Si la descarga fallo, verifica tu conexion o configura HTTP_PROXY/HTTPS_PROXY."
         Write-Info "Descarga manual: https://nodejs.org"
         $script:Errors += "Node.js"
+    }
+}
+
+function Install-Python {
+    Write-Step "Verificando Python..."
+
+    if ($script:HasPyVersionManager) {
+        Write-Skip "Python gestionado por $($script:PyVersionManagerName) — se respeta tu instalacion"
+        $script:AlreadyInstalled += "Python ($($script:PyVersionManagerName))"
+        Save-State -Mode "native" -Phase "installing-native" -Artifacts @{ pythonChannel = "skipped-user-manager" }
+        return
+    }
+
+    # Check both command in PATH and the py launcher
+    $pyExists = (Test-CommandExists "python") -or (Test-CommandExists "python3") -or (Test-CommandExists "py")
+    if ($pyExists) {
+        $v = try { (python --version) 2>&1 } catch { try { (py --version) 2>&1 } catch { "OK" } }
+        Write-Skip "Python ya instalado ($v)"
+        $script:AlreadyInstalled += "Python"
+        return
+    }
+
+    Write-Step "Instalando Python 3.12 (via winget)..."
+    try {
+        winget install $script:PythonWingetId --scope user --accept-package-agreements --accept-source-agreements --silent
+        Update-SessionPath
+
+        if (-not (Test-CommandExists "python")) {
+            $pyDir = Join-Path $env:LOCALAPPDATA "Programs\Python\Python312"
+            if (Test-Path "$pyDir\python.exe") {
+                $env:Path = "$pyDir;$pyDir\Scripts;$env:Path"
+                Write-Info "Python agregado al PATH de la sesion actual"
+            }
+        }
+
+        if ((Test-CommandExists "python") -or (Test-CommandExists "py")) {
+            $v = try { (python --version) 2>&1 } catch { "Python 3.12" }
+            Write-Ok "Python instalado ($v)"
+            $script:Installed += "Python"
+            $script:NeedNewTerminal = $true
+            Save-State -Mode "native" -Phase "installing-native" -Artifacts @{
+                pythonInstalledByUs = $true
+                pythonChannel = "winget"
+            }
+        } else { throw "Python no encontrado post-install" }
+    }
+    catch {
+        Write-Err "No se pudo instalar Python: $_"
+        Write-Info "Descarga manual: https://www.python.org/downloads/windows/"
+        $script:Errors += "Python"
     }
 }
 
@@ -355,7 +1074,6 @@ function Install-ClaudeCode {
     }
 
     if (Test-Path $claudePath) {
-        # Existe pero no está en PATH — agregarlo permanentemente
         $userPath = [System.Environment]::GetEnvironmentVariable("Path", "User")
         if ($userPath -notmatch [regex]::Escape($claudeDir)) {
             [System.Environment]::SetEnvironmentVariable("Path", "$claudeDir;$userPath", "User")
@@ -381,20 +1099,18 @@ function Install-ClaudeCode {
         Invoke-Expression (Invoke-RestMethod https://claude.ai/install.ps1)
         Update-SessionPath
 
-        # Agregar .local\bin al PATH del usuario permanentemente si no está
         $userPath = [System.Environment]::GetEnvironmentVariable("Path", "User")
         if ($userPath -notmatch [regex]::Escape($claudeDir)) {
             $newPathLen = "$claudeDir;$userPath".Length
             if ($newPathLen -gt 2048) {
-                Write-Warn "Agregar Claude al PATH excederia el limite de 2048 caracteres ($newPathLen)."
-                Write-Info "Claude se instalo pero el PATH no se actualizo. Agrega manualmente: $claudeDir"
+                Write-Warn "Agregar Claude al PATH excederia 2048 chars ($newPathLen)."
+                Write-Info "Claude instalado pero PATH no actualizado. Agrega: $claudeDir"
             } else {
                 [System.Environment]::SetEnvironmentVariable("Path", "$claudeDir;$userPath", "User")
                 Write-Info "Claude Code agregado al PATH del usuario"
             }
         }
 
-        # Agregar al PATH de la sesion actual tambien
         if ($env:Path -notmatch [regex]::Escape($claudeDir)) {
             $env:Path = "$claudeDir;$env:Path"
         }
@@ -412,14 +1128,31 @@ function Install-ClaudeCode {
     }
 }
 
+function Invoke-NativeMode {
+    Write-Separator
+    Write-Host "  Modo NATIVO — instalando en Windows nativo (sin WSL)" -ForegroundColor Cyan
+    Write-Separator
+    Write-Host ""
+
+    Save-State -Mode "native" -Phase "installing-native"
+
+    Install-GitForWindows
+    Install-NodeJS
+    Install-Python
+    Install-ClaudeCode
+
+    Save-State -Mode "native" -Phase "done"
+}
+
 # ═══════════════════════════════════════════════════════════════
 #  Resumen Final
 # ═══════════════════════════════════════════════════════════════
 
 function Write-Summary {
+    param([string]$Mode)
+
     Write-Host ""
     Write-Separator
-
     if ($script:Errors.Count -eq 0) {
         $icon = if ($script:UseEmoji) { "🎉" } else { "[OK]" }
         Write-Host "  $icon Instalacion completada exitosamente!" -ForegroundColor Green
@@ -427,77 +1160,169 @@ function Write-Summary {
         $icon = if ($script:UseEmoji) { "⚠️" } else { "[WARN]" }
         Write-Host "  $icon Instalacion completada con errores" -ForegroundColor Yellow
     }
-
     Write-Separator
     Write-Host ""
 
     if ($script:Installed.Count -gt 0) {
-        $pkgIcon = if ($script:UseEmoji) { "📦" } else { "[NEW]" }
-        $okIcon = if ($script:UseEmoji) { "✅" } else { "[OK]" }
-        Write-Host "  $pkgIcon Instalado ahora:" -ForegroundColor White
-        foreach ($item in $script:Installed) {
-            Write-Host "     $okIcon $item" -ForegroundColor Green
-        }
+        Write-Host "  Instalado ahora:" -ForegroundColor White
+        foreach ($item in $script:Installed) { Write-Host "     + $item" -ForegroundColor Green }
         Write-Host ""
     }
 
     if ($script:AlreadyInstalled.Count -gt 0) {
-        $skipIcon = if ($script:UseEmoji) { "⏭️" } else { "[SKIP]" }
-        $okIcon = if ($script:UseEmoji) { "✅" } else { "[OK]" }
-        Write-Host "  $skipIcon Ya estaba instalado:" -ForegroundColor White
-        foreach ($item in $script:AlreadyInstalled) {
-            Write-Host "     $okIcon $item" -ForegroundColor Green
-        }
+        Write-Host "  Ya estaba instalado:" -ForegroundColor White
+        foreach ($item in $script:AlreadyInstalled) { Write-Host "     = $item" -ForegroundColor Green }
         Write-Host ""
     }
 
     if ($script:Errors.Count -gt 0) {
-        $errIcon = if ($script:UseEmoji) { "❌" } else { "[ERROR]" }
-        Write-Host "  $errIcon No se pudo instalar:" -ForegroundColor White
-        foreach ($item in $script:Errors) {
-            Write-Host "     $errIcon $item" -ForegroundColor Red
-        }
+        Write-Host "  No se pudo instalar:" -ForegroundColor White
+        foreach ($item in $script:Errors) { Write-Host "     X $item" -ForegroundColor Red }
         Write-Host ""
     }
 
-    $listIcon = if ($script:UseEmoji) { "📋" } else { "[VER]" }
-    Write-Host "  $listIcon Versiones finales:" -ForegroundColor White
-    Write-Host "  -------------------------------------"
-    if (Test-CommandExists "git")    { Write-Host "     Git:         $(git --version)" }
-    if (Test-CommandExists "node")   { Write-Host "     Node.js:     $(node --version)" }
-    if (Test-CommandExists "npm")    { $npmVer = try { npm.cmd --version 2>$null } catch { npm --version 2>$null }; Write-Host "     npm:         $npmVer" }
-    if (Test-CommandExists "claude") {
-        $cv = try { claude --version 2>$null } catch { "ver nueva terminal" }
-        Write-Host "     Claude Code: $cv"
-    }
+    Write-Host "  Versiones finales:" -ForegroundColor White
     Write-Host "  -------------------------------------"
 
-    Write-Host ""
-    Write-Separator
-    $pinIcon = if ($script:UseEmoji) { "📌" } else { "[>>]" }
-    $rocketIcon = if ($script:UseEmoji) { "🚀" } else { "" }
-    Write-Host "  $pinIcon Siguiente paso:" -ForegroundColor White
-    if ($script:NeedNewTerminal) {
+    if ($Mode -eq "wsl") {
+        if (Test-UbuntuInstalled) {
+            $verCmds = @(
+                @{ Label = "Git";         Cmd = "git --version 2>/dev/null" },
+                @{ Label = "Node.js";     Cmd = "node --version 2>/dev/null" },
+                @{ Label = "npm";         Cmd = "npm --version 2>/dev/null" },
+                @{ Label = "Python";      Cmd = "python3 --version 2>/dev/null" },
+                @{ Label = "pip";         Cmd = 'pip3 --version 2>/dev/null | awk ''{print $1, $2}''' },
+                @{ Label = "Claude Code"; Cmd = "claude --version 2>/dev/null || echo 'ver nueva terminal'" }
+            )
+            foreach ($v in $verCmds) {
+                $r = Invoke-WSL-AsUser $v.Cmd
+                $out = ($r.Output -join "`n").Trim()
+                if ($out) {
+                    Write-Host ("     {0,-12} {1}" -f "$($v.Label):", $out)
+                }
+            }
+        }
+        Write-Host "  -------------------------------------"
+        Write-Host ""
+        Write-Separator
+        Write-Host "  Siguiente paso:" -ForegroundColor White
         Write-Host "     1. CIERRA esta terminal"
         Write-Host "     2. ABRE una nueva terminal"
-    } else {
-        Write-Host "     1. Abre una terminal"
+        Write-Host "     3. Escribe:  claude"
+        Write-Host "        (el wrapper ejecuta claude dentro de Ubuntu automaticamente)"
+        Write-Host "     4. Autenticate con tu cuenta (Pro o Max)"
+        Write-Host ""
+        Write-Host "     Tambien puedes entrar a Ubuntu directamente con:  wsl"
+        Write-Host "     Dentro de Ubuntu tienes git, node, npm, python3, pip y claude."
+        Write-Separator
     }
-    Write-Host "     3. Escribe:  claude"
-    Write-Host "     4. Autenticate con tu cuenta (Pro o Max)"
-    Write-Host "     5. Listo! Ya puedes usar Claude Code $rocketIcon"
-    Write-Separator
+    else {
+        if (Test-CommandExists "git")    { Write-Host "     Git:         $(git --version)" }
+        if (Test-CommandExists "node")   { Write-Host "     Node.js:     $(node --version)" }
+        if (Test-CommandExists "npm")    { $npmVer = try { npm.cmd --version 2>$null } catch { npm --version 2>$null }; Write-Host "     npm:         $npmVer" }
+        if (Test-CommandExists "python") { Write-Host "     Python:      $(python --version 2>&1)" }
+        if (Test-CommandExists "pip")    { $pipVer = try { (pip --version 2>&1) } catch { "" }; if ($pipVer) { Write-Host "     pip:         $pipVer" } }
+        if (Test-CommandExists "claude") {
+            $cv = try { claude --version 2>$null } catch { "ver nueva terminal" }
+            Write-Host "     Claude Code: $cv"
+        }
+        Write-Host "  -------------------------------------"
+        Write-Host ""
+        Write-Separator
+        Write-Host "  Siguiente paso:" -ForegroundColor White
+        if ($script:NeedNewTerminal) {
+            Write-Host "     1. CIERRA esta terminal"
+            Write-Host "     2. ABRE una nueva terminal"
+        } else {
+            Write-Host "     1. Abre una terminal"
+        }
+        Write-Host "     3. Escribe:  claude"
+        Write-Host "     4. Autenticate con tu cuenta (Pro o Max)"
+        Write-Separator
+    }
     Write-Host ""
 }
 
 # ═══════════════════════════════════════════════════════════════
-#  Funciones de Desinstalación
+#  Desinstalacion
 # ═══════════════════════════════════════════════════════════════
 
-$script:Removed = @()
-$script:NotFound = @()
+function Uninstall-WSLMode {
+    param($State)
 
-function Uninstall-ClaudeCode {
+    # Resolve the actual distro name: prefer state.json record, else detect
+    $distroToRemove = $null
+    if ($State -and $State.distroName) { $distroToRemove = $State.distroName }
+    if (-not $distroToRemove) { $distroToRemove = Get-InstalledUbuntuDistro }
+    if (-not $distroToRemove) { $distroToRemove = $script:WSLDistro }
+
+    Write-Host ""
+    Write-Host "  !! DESINSTALACION WSL" -ForegroundColor Red
+    Write-Host "  Se eliminara la distro '$distroToRemove' COMPLETA." -ForegroundColor Red
+    Write-Host "  Esto incluye TODOS los archivos y proyectos dentro de ella." -ForegroundColor Red
+    Write-Host "  NO se deshabilitara WSL a nivel de Windows (otras distros seguiran funcionando)." -ForegroundColor Yellow
+    Write-Host ""
+    if ($env:CLAUDE_SETUP_YES -eq "1") {
+        Write-Info "CLAUDE_SETUP_YES=1 — saltando confirmacion"
+    } else {
+        $confirm = Read-Host "  Continuar? (s/N)"
+        if ($confirm -ne "s" -and $confirm -ne "S") {
+            Write-Info "Desinstalacion cancelada."; return
+        }
+    }
+
+    Write-Host ""
+    Write-Step "Desregistrando distro '$distroToRemove'..."
+    $actualExists = (Get-InstalledUbuntuDistro) -eq $distroToRemove
+    if ($actualExists -or (Test-UbuntuInstalled)) {
+        try {
+            wsl.exe --unregister $distroToRemove 2>&1 | Out-Null
+            if ($LASTEXITCODE -eq 0) {
+                Write-Ok "Distro '$distroToRemove' desregistrada"
+                $script:Removed += "Distro '$distroToRemove' (WSL)"
+            } else {
+                Write-Warn "wsl --unregister devolvio exit code $LASTEXITCODE"
+                $script:Errors += "Distro '$distroToRemove' (WSL)"
+            }
+        } catch {
+            Write-Err "Error desregistrando distro: $_"
+            $script:Errors += "Distro '$distroToRemove' (WSL)"
+        }
+    } else {
+        Write-Skip "Distro '$distroToRemove' no estaba instalada"
+        $script:NotFound += "Distro '$distroToRemove' (WSL)"
+    }
+
+    # Remove host wrapper
+    Write-Step "Eliminando wrapper de claude en el host..."
+    if (Test-Path $script:HostWrapperPath) {
+        Remove-Item $script:HostWrapperPath -Force -ErrorAction SilentlyContinue
+        Write-Ok "Wrapper eliminado: $($script:HostWrapperPath)"
+        $script:Removed += "claude.cmd (host wrapper)"
+    } else {
+        Write-Skip "Wrapper no encontrado"
+    }
+
+    # Clean user PATH
+    $userPath = [System.Environment]::GetEnvironmentVariable("Path", "User")
+    if ($userPath -and $userPath -match [regex]::Escape($script:HostWrapperDir)) {
+        $cleanPath = ($userPath -split ';' | Where-Object {
+            $_ -ne $script:HostWrapperDir -and $_ -ne ''
+        }) -join ';'
+        [System.Environment]::SetEnvironmentVariable("Path", $cleanPath, "User")
+        Write-Ok "PATH del usuario limpiado"
+    }
+
+    # Remove .local\bin if empty
+    if ((Test-Path $script:HostWrapperDir) -and ((Get-ChildItem $script:HostWrapperDir -Force | Measure-Object).Count -eq 0)) {
+        Remove-Item $script:HostWrapperDir -Force -ErrorAction SilentlyContinue
+    }
+
+    Clear-State
+    Write-Ok "Estado local limpiado"
+}
+
+function Uninstall-ClaudeCodeNative {
     Write-Step "Desinstalando Claude Code..."
 
     $claudePath = "$env:USERPROFILE\.local\bin\claude.exe"
@@ -507,13 +1332,11 @@ function Uninstall-ClaudeCode {
         Remove-Item -Recurse -Force "$env:USERPROFILE\.config\claude" -ErrorAction SilentlyContinue
         Remove-Item -Recurse -Force "$env:APPDATA\Claude" -ErrorAction SilentlyContinue
 
-        # Limpiar PATH del usuario
         $userPath = [System.Environment]::GetEnvironmentVariable("Path", "User")
         if ($userPath -and $userPath -match '\.local\\bin') {
             $cleanPath = ($userPath -split ';' | Where-Object { $_ -notmatch '\.local\\bin' -and $_ -ne '' }) -join ';'
             [System.Environment]::SetEnvironmentVariable("Path", $cleanPath, "User")
         }
-
         Write-Ok "Claude Code eliminado"
         $script:Removed += "Claude Code"
     } else {
@@ -522,7 +1345,48 @@ function Uninstall-ClaudeCode {
     }
 }
 
-function Uninstall-NodeJS {
+function Uninstall-PythonNative {
+    param($State)
+    Write-Step "Desinstalando Python..."
+
+    $pythonOwned = $false
+    if ($State -and $State.artifactsInstalled -and $State.artifactsInstalled.pythonInstalledByUs -eq $true) {
+        $pythonOwned = $true
+    }
+
+    if (-not $pythonOwned) {
+        Write-Skip "Python no fue instalado por este script — no se toca"
+        $script:NotFound += "Python (no era nuestro)"
+        return
+    }
+
+    try {
+        winget uninstall $script:PythonWingetId --silent 2>$null
+        if ($LASTEXITCODE -eq 0) {
+            Write-Ok "Python eliminado"
+            $script:Removed += "Python"
+        } else {
+            Write-Warn "winget uninstall Python devolvio $LASTEXITCODE"
+            $script:Errors += "Python"
+        }
+    } catch {
+        Write-Err "No se pudo eliminar Python: $_"
+        $script:Errors += "Python"
+    }
+
+    # Clean PATH for Python dirs
+    foreach ($scope in @("User", "Machine")) {
+        $pathVal = [System.Environment]::GetEnvironmentVariable("Path", $scope)
+        if ($pathVal -and $pathVal -match 'Python3\d+') {
+            $cleanPath = ($pathVal -split ';' | Where-Object {
+                $_ -notmatch 'Python3\d+' -and $_ -ne ''
+            }) -join ';'
+            try { [System.Environment]::SetEnvironmentVariable("Path", $cleanPath, $scope) } catch { }
+        }
+    }
+}
+
+function Uninstall-NodeJSNative {
     Write-Step "Desinstalando Node.js..."
 
     $nodeExists = (Test-CommandExists "node") -or (Test-Path "C:\Program Files\nodejs\node.exe")
@@ -534,21 +1398,17 @@ function Uninstall-NodeJS {
 
     $uninstalled = $false
 
-    # Nivel 1: winget
     Write-Step "Intentando desinstalar Node.js via winget..."
     try {
-        $wingetResult = winget uninstall OpenJS.NodeJS.LTS --silent 2>&1
+        winget uninstall OpenJS.NodeJS.LTS --silent 2>&1 | Out-Null
         if ($LASTEXITCODE -eq 0) {
             Write-Ok "Node.js eliminado via winget"
             $uninstalled = $true
-        } else {
-            throw "winget exit code: $LASTEXITCODE"
         }
     } catch {
-        Write-Warn "winget no pudo desinstalar Node.js ($($_.Exception.Message))"
+        Write-Warn "winget no pudo desinstalar Node.js"
     }
 
-    # Nivel 2: msiexec via registro
     if (-not $uninstalled) {
         Write-Step "Intentando via msiexec..."
         try {
@@ -566,33 +1426,18 @@ function Uninstall-NodeJS {
                 if ($msiResult.ExitCode -eq 0) {
                     Write-Ok "Node.js eliminado via msiexec"
                     $uninstalled = $true
-                } else {
-                    throw "msiexec exit code: $($msiResult.ExitCode)"
                 }
-            } else {
-                throw "No se encontro MSI ID de Node.js en el registro"
             }
-        } catch {
-            Write-Warn "msiexec no pudo desinstalar Node.js ($($_.Exception.Message))"
-        }
+        } catch { }
     }
 
-    # Nivel 3: limpieza manual
     if (-not $uninstalled) {
         Write-Step "Realizando limpieza manual de Node.js..."
-        $nodeDirs = @(
-            "C:\Program Files\nodejs",
-            "$env:APPDATA\npm",
-            "$env:APPDATA\npm-cache",
-            "$env:USERPROFILE\.node-gyp"
-        )
+        $nodeDirs = @("C:\Program Files\nodejs", "$env:APPDATA\npm", "$env:APPDATA\npm-cache", "$env:USERPROFILE\.node-gyp")
         foreach ($dir in $nodeDirs) {
-            if (Test-Path $dir) {
-                Remove-Item -Recurse -Force $dir -ErrorAction SilentlyContinue
-            }
+            if (Test-Path $dir) { Remove-Item -Recurse -Force $dir -ErrorAction SilentlyContinue }
         }
 
-        # Limpiar entradas del registro para que winget no crea que sigue instalado
         $uninstallKeys = @(
             "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall",
             "HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall",
@@ -603,49 +1448,31 @@ function Uninstall-NodeJS {
                 Get-ChildItem $keyPath -ErrorAction SilentlyContinue |
                     Where-Object { (Get-ItemProperty $_.PSPath -ErrorAction SilentlyContinue).DisplayName -match 'Node\.js|Node JS' } |
                     ForEach-Object { Remove-Item $_.PSPath -Recurse -Force -ErrorAction SilentlyContinue }
-            } catch {
-                # Registry cleanup may need admin — not critical
-            }
+            } catch { }
         }
-
         Write-Ok "Node.js eliminado via limpieza manual"
         $uninstalled = $true
     }
 
-    # Limpiar carpetas residuales (en todos los casos)
     Remove-Item -Recurse -Force "$env:APPDATA\npm" -ErrorAction SilentlyContinue
     Remove-Item -Recurse -Force "$env:APPDATA\npm-cache" -ErrorAction SilentlyContinue
     Remove-Item -Recurse -Force "$env:USERPROFILE\.node-gyp" -ErrorAction SilentlyContinue
 
-    # Limpiar PATH de entradas de nodejs y npm
     foreach ($scope in @("User", "Machine")) {
         $pathVal = [System.Environment]::GetEnvironmentVariable("Path", $scope)
         if ($pathVal -and ($pathVal -match 'nodejs' -or $pathVal -match '\\npm')) {
             $cleanPath = ($pathVal -split ';' | Where-Object {
                 $_ -notmatch 'nodejs' -and $_ -notmatch '\\npm$' -and $_ -notmatch '\\npm\\' -and $_ -ne ''
             }) -join ';'
-            try {
-                [System.Environment]::SetEnvironmentVariable("Path", $cleanPath, $scope)
-            } catch {
-                if ($scope -eq "Machine") {
-                    Write-Warn "No se pudo limpiar el PATH de Machine (requiere admin)."
-                    Write-Info "Ejecuta como admin para limpiar completamente."
-                }
-            }
+            try { [System.Environment]::SetEnvironmentVariable("Path", $cleanPath, $scope) } catch { }
         }
     }
 
     Update-SessionPath
-
-    if ($uninstalled) {
-        $script:Removed += "Node.js"
-    } else {
-        Write-Err "No se pudo eliminar Node.js completamente"
-        $script:Errors += "Node.js"
-    }
+    if ($uninstalled) { $script:Removed += "Node.js" } else { $script:Errors += "Node.js" }
 }
 
-function Uninstall-Git {
+function Uninstall-GitNative {
     Write-Step "Desinstalando Git..."
 
     $gitExists = (Test-CommandExists "git") -or (Test-Path "C:\Program Files\Git\bin\git.exe")
@@ -659,18 +1486,11 @@ function Uninstall-Git {
         winget uninstall Git.Git --silent 2>$null
         Update-SessionPath
 
-        # Limpiar PATH residual de Git
         foreach ($scope in @("User", "Machine")) {
             $pathVal = [System.Environment]::GetEnvironmentVariable("Path", $scope)
             if ($pathVal -and $pathVal -match 'Git') {
-                $cleanPath = ($pathVal -split ';' | Where-Object {
-                    $_ -notmatch '\\Git\\' -and $_ -ne ''
-                }) -join ';'
-                try {
-                    [System.Environment]::SetEnvironmentVariable("Path", $cleanPath, $scope)
-                } catch {
-                    # Machine PATH requires admin — skip silently
-                }
+                $cleanPath = ($pathVal -split ';' | Where-Object { $_ -notmatch '\\Git\\' -and $_ -ne '' }) -join ';'
+                try { [System.Environment]::SetEnvironmentVariable("Path", $cleanPath, $scope) } catch { }
             }
         }
 
@@ -679,81 +1499,88 @@ function Uninstall-Git {
         $script:Removed += "Git"
     } catch {
         Write-Err "No se pudo eliminar Git: $_"
-        Write-Info "Causa probable: winget fallo durante la desinstalacion."
-        Write-Info "Intenta manualmente: winget uninstall Git.Git"
         $script:Errors += "Git"
     }
 }
 
-function Write-UninstallSummary {
-    Write-Host ""
-    Write-Separator
+function Uninstall-NativeMode {
+    param($State)
 
-    $cleanIcon = if ($script:UseEmoji) { "🧹" } else { "[OK]" }
-    if ($script:Errors.Count -eq 0) {
-        Write-Host "  $cleanIcon Desinstalacion completada" -ForegroundColor Green
+    Write-Host ""
+    Write-Host "  !! MODO DESINSTALACION (nativo)" -ForegroundColor Red
+    Write-Host "  Se eliminaran: Claude Code, Node.js, Git, Python (si lo instalo este script)" -ForegroundColor Red
+    Write-Host ""
+    if ($env:CLAUDE_SETUP_YES -eq "1") {
+        Write-Info "CLAUDE_SETUP_YES=1 — saltando confirmacion"
     } else {
-        $warnIcon = if ($script:UseEmoji) { "⚠️" } else { "[WARN]" }
-        Write-Host "  $warnIcon Desinstalacion completada con errores" -ForegroundColor Yellow
+        $confirm = Read-Host "  Continuar? (s/N)"
+        if ($confirm -ne "s" -and $confirm -ne "S") {
+            Write-Info "Desinstalacion cancelada."; return
+        }
     }
 
+    Write-Host ""
+    Uninstall-ClaudeCodeNative
+    Uninstall-NodeJSNative
+    Uninstall-PythonNative -State $State
+    Uninstall-GitNative
+
+    Clear-State
+}
+
+function Write-UninstallSummary {
+    param([string]$Mode)
+    Write-Host ""
+    Write-Separator
+    if ($script:Errors.Count -eq 0) {
+        Write-Host "  Desinstalacion completada" -ForegroundColor Green
+    } else {
+        Write-Host "  Desinstalacion completada con errores" -ForegroundColor Yellow
+    }
     Write-Separator
     Write-Host ""
 
     if ($script:Removed.Count -gt 0) {
-        $trashIcon = if ($script:UseEmoji) { "🗑️" } else { "[DEL]" }
-        $okIcon = if ($script:UseEmoji) { "✅" } else { "[OK]" }
-        Write-Host "  $trashIcon Eliminado:" -ForegroundColor White
-        foreach ($item in $script:Removed) {
-            Write-Host "     $okIcon $item" -ForegroundColor Green
-        }
+        Write-Host "  Eliminado:" -ForegroundColor White
+        foreach ($item in $script:Removed) { Write-Host "     - $item" -ForegroundColor Green }
         Write-Host ""
     }
-
     if ($script:NotFound.Count -gt 0) {
-        $skipIcon = if ($script:UseEmoji) { "⏭️" } else { "[SKIP]" }
-        Write-Host "  $skipIcon No estaba instalado:" -ForegroundColor White
-        foreach ($item in $script:NotFound) {
-            Write-Host "     - $item" -ForegroundColor Cyan
-        }
+        Write-Host "  No estaba instalado:" -ForegroundColor White
+        foreach ($item in $script:NotFound) { Write-Host "     . $item" -ForegroundColor Cyan }
         Write-Host ""
     }
-
     if ($script:Errors.Count -gt 0) {
-        $errIcon = if ($script:UseEmoji) { "❌" } else { "[ERROR]" }
-        Write-Host "  $errIcon No se pudo eliminar:" -ForegroundColor White
-        foreach ($item in $script:Errors) {
-            Write-Host "     $errIcon $item" -ForegroundColor Red
-        }
+        Write-Host "  No se pudo eliminar:" -ForegroundColor White
+        foreach ($item in $script:Errors) { Write-Host "     X $item" -ForegroundColor Red }
         Write-Host ""
     }
 
-    # Verificación post-desinstalación
-    Write-Host ""
-    $checkIcon = if ($script:UseEmoji) { "🔍" } else { "[CHK]" }
-    Write-Host "  $checkIcon Verificacion post-desinstalacion:" -ForegroundColor White
+    Write-Host "  Verificacion post-desinstalacion:" -ForegroundColor White
     Update-SessionPath
 
-    $residualItems = @()
-    if (Test-CommandExists "node")   { $residualItems += "node" }
-    if (Test-CommandExists "git")    { $residualItems += "git" }
-    if (Test-CommandExists "claude") { $residualItems += "claude" }
-    if (Test-Path "C:\Program Files\nodejs") { $residualItems += "carpeta nodejs" }
-    if (Test-Path "$env:USERPROFILE\.local\bin\claude.exe") { $residualItems += "claude.exe" }
-
-    if ($residualItems.Count -eq 0) {
-        $okIcon = if ($script:UseEmoji) { "✅" } else { "[OK]" }
-        Write-Host "     $okIcon Sistema limpio — no quedan residuos" -ForegroundColor Green
+    $residual = @()
+    if ($Mode -eq "wsl") {
+        if (Test-UbuntuInstalled) { $residual += "Ubuntu (WSL)" }
+        if (Test-Path $script:HostWrapperPath) { $residual += "claude.cmd" }
+        if (Test-Path $script:StateFile) { $residual += "state.json" }
     } else {
-        $warnIcon = if ($script:UseEmoji) { "⚠️" } else { "[WARN]" }
-        Write-Host "     $warnIcon Residuos detectados: $($residualItems -join ', ')" -ForegroundColor Yellow
-        Write-Host "     Abre una nueva terminal y verifica. Puede requerir reinicio." -ForegroundColor Yellow
+        if (Test-CommandExists "node")   { $residual += "node" }
+        if (Test-CommandExists "git")    { $residual += "git" }
+        if (Test-CommandExists "claude") { $residual += "claude" }
+        if (Test-Path "C:\Program Files\nodejs") { $residual += "carpeta nodejs" }
+        if (Test-Path "$env:USERPROFILE\.local\bin\claude.exe") { $residual += "claude.exe" }
     }
 
+    if ($residual.Count -eq 0) {
+        Write-Host "     Sistema limpio — no quedan residuos" -ForegroundColor Green
+    } else {
+        Write-Host "     Residuos detectados: $($residual -join ', ')" -ForegroundColor Yellow
+        Write-Host "     Abre una nueva terminal y verifica. Puede requerir reinicio." -ForegroundColor Yellow
+    }
     Write-Host ""
     Write-Separator
-    $pinIcon = if ($script:UseEmoji) { "📌" } else { "[>>]" }
-    Write-Host "  $pinIcon Nota:" -ForegroundColor White
+    Write-Host "  Nota:" -ForegroundColor White
     Write-Host "     Cierra y abre una nueva terminal para que los cambios de PATH surtan efecto."
     Write-Separator
     Write-Host ""
@@ -762,63 +1589,112 @@ function Write-UninstallSummary {
 function Run-Uninstall {
     Clear-Host
     Write-Header
-    Write-SystemInfo
+    Write-SystemInfo -Mode "UNINSTALL"
 
-    Write-Host ""
-    Write-Host "  !! MODO DESINSTALACION" -ForegroundColor Red
-    Write-Host "  Se eliminaran: Claude Code, Node.js, Git" -ForegroundColor Red
-    Write-Host ""
-    $confirm = Read-Host "  Continuar? (s/N)"
-    if ($confirm -ne "s" -and $confirm -ne "S") {
-        Write-Host ""
-        Write-Info "Desinstalacion cancelada."
-        return
+    $state = Read-State
+    $uninstallMode = "native"  # default guess
+    if ($state -and $state.mode) {
+        $uninstallMode = $state.mode
+    } else {
+        # Heuristic: if wrapper exists or Ubuntu distro present, assume WSL
+        if ((Test-Path $script:HostWrapperPath) -or (Test-UbuntuInstalled)) {
+            $uninstallMode = "wsl"
+        }
     }
 
-    Write-Host ""
-    Write-Info "Iniciando desinstalacion..."
-    Write-Host ""
+    Write-Info "Modo detectado: $uninstallMode"
 
-    Uninstall-ClaudeCode
-    Uninstall-NodeJS
-    Uninstall-Git
+    if ($uninstallMode -eq "wsl") {
+        Uninstall-WSLMode -State $state
+    } else {
+        Uninstall-NativeMode -State $state
+    }
 
-    Write-UninstallSummary
+    Write-UninstallSummary -Mode $uninstallMode
 }
 
 # ═══════════════════════════════════════════════════════════════
-#  Main
+#  WSL Mode — Orquestador
+# ═══════════════════════════════════════════════════════════════
+
+function Invoke-WSLMode {
+    param([bool]$IsResume = $false)
+
+    if ($IsResume) {
+        $state = Read-State
+        Write-Info "Resumiendo desde fase: $($state.phase)"
+        Write-Host ""
+    }
+
+    Test-WindowsVersion
+    Test-Preflight -Mode "wsl"
+
+    $repoName = if ($env:ZERO_CLAUDE_REPO) { $env:ZERO_CLAUDE_REPO } else { "" }
+    $repoBranch = if ($env:ZERO_CLAUDE_BRANCH) { $env:ZERO_CLAUDE_BRANCH } else { "" }
+    Save-State -Mode "wsl" -Phase "enabling-wsl" -RepoName $repoName -RepoBranch $repoBranch
+
+    if (-not (Invoke-PhaseA-EnableWSL)) { return }
+    if (-not (Invoke-PhaseB-InstallUbuntu)) { return }
+    if (-not (Invoke-PhaseC-InstallInWSL)) { return }
+    if (-not (Invoke-PhaseD-HostWrapper)) { return }
+
+    Save-State -Mode "wsl" -Phase "done"
+    Write-Summary -Mode "wsl"
+}
+
+# ═══════════════════════════════════════════════════════════════
+#  Main (dispatcher)
 # ═══════════════════════════════════════════════════════════════
 
 function Main {
+    $cmdArgs = $args
+    $mode = Get-InstallMode -CmdArgs $cmdArgs
+
+    # If there's a persisted repo override from a prior run, apply it to env
+    $priorState = Read-State
+    if ($priorState) {
+        if ($priorState.repoName -and -not $env:ZERO_CLAUDE_REPO) {
+            $env:ZERO_CLAUDE_REPO = $priorState.repoName
+        }
+        if ($priorState.repoBranch -and -not $env:ZERO_CLAUDE_BRANCH) {
+            $env:ZERO_CLAUDE_BRANCH = $priorState.repoBranch
+        }
+        # Restore the detected distro name so post-reboot runs use the same one
+        if ($priorState.distroName) {
+            $script:ActualDistro = $priorState.distroName
+        }
+        if ($priorState.wslUser) {
+            $script:WSLDefaultUser = $priorState.wslUser
+        }
+    }
+
+    if ($mode -eq "uninstall") {
+        Run-Uninstall
+        return
+    }
+
     Clear-Host
     Write-Header
-    Test-WindowsVersion
-    Write-SystemInfo
 
-    Test-Preflight
+    if ($mode -eq "resume") {
+        $state = Read-State
+        Write-SystemInfo -Mode "WSL (resumiendo post-reboot)"
+        Invoke-WSLMode -IsResume $true
+        return
+    }
 
-    Write-Host ""
-    Write-Info "Iniciando instalacion..."
-    Write-Host ""
+    if ($mode -eq "native") {
+        Write-SystemInfo -Mode "NATIVE (Windows nativo)"
+        Test-WindowsVersion
+        Test-Preflight -Mode "native"
+        Invoke-NativeMode
+        Write-Summary -Mode "native"
+        return
+    }
 
-    Install-GitForWindows
-    Install-NodeJS
-    Install-ClaudeCode
-
-    Write-Summary
+    # Default: WSL
+    Write-SystemInfo -Mode "WSL (Ubuntu dentro de Windows)"
+    Invoke-WSLMode
 }
 
-# Detectar modo: --uninstall o instalacion normal
-$isUninstall = $false
-if ($args -contains "--uninstall") {
-    $isUninstall = $true
-} elseif ($env:CLAUDE_SETUP_UNINSTALL -eq "1") {
-    $isUninstall = $true
-}
-
-if ($isUninstall) {
-    Run-Uninstall
-} else {
-    Main
-}
+Main @args

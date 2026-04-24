@@ -617,7 +617,11 @@ function Invoke-PhaseA-EnableWSL {
                 Write-Info "Reinicia manualmente cuando puedas y vuelve a correr el comando."
             }
         }
-        Invoke-Halt -Code 0
+        # Return $false so Invoke-WSLMode stops; don't throw — `throw` bubbles
+        # up errors that some hosts log noisily even when caught by our wrapper.
+        # A plain return is the cleanest way to halt the pipeline without
+        # touching the host PowerShell session.
+        return $false
     }
 
     # Try to set WSL 2 as default (requires kernel). Wrap with 30s timeout —

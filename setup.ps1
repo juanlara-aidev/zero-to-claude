@@ -25,7 +25,7 @@ $script:RegKey = "HKCU:\Software\ZeroClaude"
 # WSL config
 $script:WSLDistro = "Ubuntu"           # desired default distro
 $script:ActualDistro = $null           # detected/chosen distro at runtime (may differ if Ubuntu-24.04 etc)
-$script:WSLDefaultUser = "claudeuser"
+$script:WSLDefaultUser = $null         # set later by Get-DefaultWSLUserName (derived from $env:USERNAME)
 $script:HostWrapperDir = Join-Path $env:USERPROFILE ".local\bin"
 $script:HostWrapperPath = Join-Path $script:HostWrapperDir "claude.cmd"
 
@@ -121,6 +121,27 @@ function Test-IsAdmin {
     $principal = New-Object Security.Principal.WindowsPrincipal $current
     return $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
 }
+
+function Get-DefaultWSLUserName {
+    # Derive a Linux-compatible username from the Windows logged-in user.
+    # Rules: lowercase a-z/0-9/_/-, must start with a letter, <=31 chars,
+    # not a system-reserved name.
+    $raw = if ($env:USERNAME) { $env:USERNAME } else { "claudeuser" }
+    $sanitized = ($raw.ToLower() -replace '[^a-z0-9_-]', '')
+    if (-not $sanitized -or $sanitized.Length -eq 0) { $sanitized = "claudeuser" }
+    if ($sanitized -match '^[^a-z]') { $sanitized = "u$sanitized" }
+    if ($sanitized.Length -gt 31) { $sanitized = $sanitized.Substring(0, 31) }
+    $reserved = @('root','daemon','bin','sys','sync','games','man','lp','mail','news',
+                  'uucp','proxy','www-data','backup','list','irc','gnats','nobody',
+                  'systemd-network','systemd-resolve','systemd-timesync','messagebus',
+                  'tss','uuidd','tcpdump','sshd','landscape','dnsmasq','ubuntu',
+                  'administrator','admin','systemd-coredump','_apt')
+    if ($reserved -contains $sanitized) { $sanitized = "${sanitized}-dev" }
+    return $sanitized
+}
+
+# Initialize default WSL user from the Windows user (overridable via state.json on resume)
+$script:WSLDefaultUser = Get-DefaultWSLUserName
 
 function Test-WindowsVersion {
     $version = [System.Environment]::OSVersion.Version
@@ -937,59 +958,117 @@ function Read-WindowsTerminalSettings {
     try {
         $content = Get-Content $Path -Raw -ErrorAction Stop
         if (-not $content) { return $null }
-        # Strip JSON5-style comments (Windows Terminal ships them by default)
-        $stripped = [regex]::Replace($content, '(?m)//.*?$', '')
-        $stripped = [regex]::Replace($stripped, '/\*.*?\*/', '', 'Singleline')
-        return ($stripped | ConvertFrom-Json -ErrorAction Stop)
+        # Try parsing as-is first (the default settings.json is valid JSON)
+        try {
+            return ($content | ConvertFrom-Json -ErrorAction Stop)
+        } catch {
+            # Fallback: strip JSON5 comments, but carefully avoid URLs like "https://..."
+            # Only strip // comments that are NOT inside a string.
+            # Simple heuristic: strip only when // follows whitespace at start of line or after non-alphanum.
+            $stripped = [regex]::Replace($content, '(^|[\s,{[])//[^\n]*', '$1')
+            $stripped = [regex]::Replace($stripped, '/\*.*?\*/', '', 'Singleline')
+            return ($stripped | ConvertFrom-Json -ErrorAction Stop)
+        }
     } catch {
         return $null
     }
 }
 
 function Set-WindowsTerminalDefaultToUbuntu {
+    # Strategy: don't rely on WT's dynamic Ubuntu profile (which isn't
+    # written to settings.json until the user manually customizes it).
+    # Instead, add an explicit custom profile with our own GUID that
+    # launches `wsl -d <distro> --cd ~` directly. Works on any VM/PC
+    # even if Windows Terminal has never been opened before.
     $wtSettings = Get-WindowsTerminalSettingsPath
     if (-not $wtSettings) {
-        Write-Skip "Windows Terminal no instalado — se salta configuracion de default profile"
+        Write-Skip "Windows Terminal no instalado — se salta configuracion (se crea shortcut en escritorio igual)"
         return @{ Changed = $false }
     }
 
     $settings = Read-WindowsTerminalSettings -Path $wtSettings
     if (-not $settings) {
-        Write-Warn "No se pudo leer settings.json de Windows Terminal (se deja sin cambios)"
-        return @{ Changed = $false }
-    }
-    if (-not $settings.profiles -or -not $settings.profiles.list) {
-        Write-Warn "Windows Terminal aun no ha generado perfiles — abre WT una vez y vuelve a correr si quieres Ubuntu como default"
+        Write-Warn "settings.json de Windows Terminal ilegible — se deja sin cambios"
         return @{ Changed = $false }
     }
 
-    $ubuntu = $settings.profiles.list | Where-Object {
-        ($_.source -eq "Windows.Terminal.Wsl" -or $_.commandline -imatch 'wsl') -and $_.name -imatch '^Ubuntu'
-    } | Select-Object -First 1
-
-    if (-not $ubuntu) {
-        Write-Warn "Perfil Ubuntu aun no aparece en Windows Terminal — puede tardar unos segundos en generarse"
-        return @{ Changed = $false }
+    # Ensure profiles.list is a mutable array — reconstruct through hashtable
+    # for forward-compat across PS versions
+    $profileName = "Claude Dev (Ubuntu)"
+    $existingGuid = $null
+    $currentList = @()
+    if ($settings.profiles -and $settings.profiles.list) {
+        $currentList = @($settings.profiles.list)
+        foreach ($p in $currentList) {
+            if ($p.name -eq $profileName) { $existingGuid = $p.guid; break }
+        }
     }
 
-    if ($settings.defaultProfile -eq $ubuntu.guid) {
-        Write-Skip "Windows Terminal ya tiene Ubuntu como perfil por defecto"
-        return @{ Changed = $false; AlreadyDefault = $true; SettingsPath = $wtSettings }
+    if ($existingGuid) {
+        $ourGuid = $existingGuid
+        Write-Skip "Perfil '$profileName' ya existe en Windows Terminal (guid=$ourGuid)"
+    } else {
+        $ourGuid = "{" + ([guid]::NewGuid().ToString()) + "}"
     }
 
-    $backup = $settings.defaultProfile
-    $settings.defaultProfile = $ubuntu.guid
+    $backup = if ($settings.defaultProfile) { [string]$settings.defaultProfile } else { "" }
+    if ($backup -eq $ourGuid) {
+        Write-Skip "Windows Terminal ya usa '$profileName' como default"
+        return @{ Changed = $false; AlreadyDefault = $true; SettingsPath = $wtSettings; OurGuid = $ourGuid }
+    }
+
+    # Backup settings.json byte-exact (once) — uninstall will restore from here
+    $backupFile = "$wtSettings.zero-claude.bak"
+    if (-not (Test-Path $backupFile)) {
+        try { Copy-Item $wtSettings $backupFile -Force } catch { }
+    }
+
+    # Build our custom profile
+    $newProfile = [pscustomobject]@{
+        guid              = $ourGuid
+        name              = $profileName
+        commandline       = "wsl.exe -d $($script:ActualDistro) --cd ~"
+        startingDirectory = "~"
+        icon              = "ms-appx:///ProfileIcons/{9acb9455-ca41-5af7-950f-6bca1bc9722f}.png"
+        hidden            = $false
+    }
+
+    # Append to list if we're adding new; else leave as-is
+    if (-not $existingGuid) {
+        $newList = @($currentList + $newProfile)
+        if (-not $settings.profiles) {
+            $settings | Add-Member -MemberType NoteProperty -Name profiles -Value ([pscustomobject]@{ defaults = [pscustomobject]@{}; list = $newList }) -Force
+        } else {
+            if ($settings.profiles.PSObject.Properties['list']) {
+                $settings.profiles.list = $newList
+            } else {
+                $settings.profiles | Add-Member -MemberType NoteProperty -Name list -Value $newList -Force
+            }
+        }
+    }
+
+    # Set defaultProfile
+    if ($settings.PSObject.Properties['defaultProfile']) {
+        $settings.defaultProfile = $ourGuid
+    } else {
+        $settings | Add-Member -MemberType NoteProperty -Name defaultProfile -Value $ourGuid -Force
+    }
 
     try {
-        # Backup original settings.json once so we can restore verbatim on uninstall
-        $backupFile = "$wtSettings.zero-claude.bak"
-        if (-not (Test-Path $backupFile)) {
-            Copy-Item $wtSettings $backupFile -Force
-        }
         $newJson = $settings | ConvertTo-Json -Depth 32
         Set-Content -Path $wtSettings -Value $newJson -Encoding UTF8
-        Write-Ok "Windows Terminal: perfil por defecto -> Ubuntu"
-        return @{ Changed = $true; BackupDefault = $backup; SettingsPath = $wtSettings; BackupFile = $backupFile }
+        if ($existingGuid) {
+            Write-Ok "Windows Terminal: '$profileName' marcado como default"
+        } else {
+            Write-Ok "Windows Terminal: perfil '$profileName' agregado y marcado como default"
+        }
+        return @{
+            Changed       = $true
+            BackupDefault = $backup
+            SettingsPath  = $wtSettings
+            BackupFile    = $backupFile
+            OurGuid       = $ourGuid
+        }
     } catch {
         Write-Warn "No se pudo escribir settings.json de Windows Terminal: $_"
         return @{ Changed = $false }
@@ -1036,11 +1115,12 @@ function Invoke-PhaseE-DefaultToLinux {
     $sc = New-ClaudeDevShortcut
 
     Save-State -Phase "done" -Artifacts @{
-        wtDefaultChanged = [bool]$wt.Changed
-        wtDefaultBackup = if ($wt.BackupDefault) { [string]$wt.BackupDefault } else { "" }
-        wtSettingsPath = if ($wt.SettingsPath) { [string]$wt.SettingsPath } else { "" }
-        wtSettingsBackupFile = if ($wt.BackupFile) { [string]$wt.BackupFile } else { "" }
-        desktopShortcut = if ($sc.Created -and $sc.Path) { [string]$sc.Path } else { "" }
+        wtDefaultChanged     = [bool]$wt.Changed
+        wtDefaultBackup      = if ($wt.BackupDefault) { [string]$wt.BackupDefault } else { "" }
+        wtSettingsPath       = if ($wt.SettingsPath)  { [string]$wt.SettingsPath }  else { "" }
+        wtSettingsBackupFile = if ($wt.BackupFile)    { [string]$wt.BackupFile }    else { "" }
+        wtCustomProfileGuid  = if ($wt.OurGuid)       { [string]$wt.OurGuid }       else { "" }
+        desktopShortcut      = if ($sc.Created -and $sc.Path) { [string]$sc.Path } else { "" }
     }
 
     Write-Ok "Entorno Linux configurado como default"
@@ -1059,22 +1139,30 @@ function Reset-WindowsTerminalDefault {
 
     if (-not $path -or -not (Test-Path $path)) { return }
 
+    $ourGuid = $art.wtCustomProfileGuid
+
     try {
         # Prefer restoring the full backup file (preserves original comments/formatting)
         if ($backupFile -and (Test-Path $backupFile)) {
             Copy-Item $backupFile $path -Force
             Remove-Item $backupFile -Force -ErrorAction SilentlyContinue
-            Write-Ok "Windows Terminal settings.json restaurado desde backup"
+            Write-Ok "Windows Terminal settings.json restaurado desde backup byte-exact"
             return
         }
-        # Fallback: just flip the defaultProfile back
+        # Fallback: surgical edit — remove our custom profile + restore defaultProfile
         $settings = Read-WindowsTerminalSettings -Path $path
-        if ($settings -and $origDefault) {
-            $settings.defaultProfile = $origDefault
-            $newJson = $settings | ConvertTo-Json -Depth 32
-            Set-Content -Path $path -Value $newJson -Encoding UTF8
-            Write-Ok "Windows Terminal default profile restaurado"
+        if (-not $settings) { return }
+
+        if ($ourGuid -and $settings.profiles -and $settings.profiles.list) {
+            $filtered = @($settings.profiles.list | Where-Object { $_.guid -ne $ourGuid })
+            $settings.profiles.list = $filtered
         }
+        if ($origDefault) {
+            $settings.defaultProfile = $origDefault
+        }
+        $newJson = $settings | ConvertTo-Json -Depth 32
+        Set-Content -Path $path -Value $newJson -Encoding UTF8
+        Write-Ok "Windows Terminal: perfil custom removido y defaultProfile restaurado"
     } catch {
         Write-Warn "No se pudo restaurar default profile de Windows Terminal: $_"
     }

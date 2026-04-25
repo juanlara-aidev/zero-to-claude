@@ -299,16 +299,25 @@ install_claude_code() {
     fi
 
     print_step "Instalando Claude Code (instalador nativo Linux)..."
-    if curl -fsSL https://claude.ai/install.sh | bash; then
-        if [[ -f "$HOME/.local/bin/claude" ]]; then
-            export PATH="$HOME/.local/bin:$PATH"
-            if command_exists claude; then
-                print_success "Claude Code instalado ($(claude --version 2>/dev/null || echo 'OK'))"
-                INSTALLED+=("Claude Code")
-                configure_claude_path
-                return 0
-            fi
-        fi
+    # Run the official installer with a timeout. The installer's post-extraction
+    # `claude install` step has a known intermittent hang (~3-5 min) where the
+    # binary is fully extracted to ~/.local/bin/claude (symlink) but the
+    # post-hook stays sleeping waiting on something. We don't need to wait for
+    # that — once the symlink exists, claude works.
+    timeout --preserve-status 90 bash -c 'curl -fsSL https://claude.ai/install.sh | bash' || true
+
+    # Don't gate on the installer's exit code. Check for the artifact directly.
+    if [[ -L "$HOME/.local/bin/claude" || -f "$HOME/.local/bin/claude" ]]; then
+        export PATH="$HOME/.local/bin:$PATH"
+        local v; v="$(claude --version 2>/dev/null || echo 'OK')"
+        print_success "Claude Code instalado ($v)"
+        INSTALLED+=("Claude Code")
+        configure_claude_path
+
+        # If the official installer's post-hook is still running (zombie/sleeping),
+        # try to terminate it cleanly so the script doesn't wait forever.
+        pkill -f 'claude.*install' 2>/dev/null || true
+        return 0
     fi
 
     print_error "No se pudo instalar Claude Code"
